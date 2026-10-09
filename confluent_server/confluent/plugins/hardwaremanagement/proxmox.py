@@ -11,10 +11,16 @@ import aiohmi.util.webclient as webclient
 import aiohmi.exceptions as pygexc
 import confluent.interface.console as conapi
 import confluent.log as log
+import confluent.firmwaremanager as firmwaremanager
+import functools
 import random
 import io
 import json
+import os
 import re
+import secrets
+import tarfile
+import time
 import urllib.parse as urlparse
 import aiohttp
 
@@ -155,6 +161,265 @@ def parse_nic(text):
         elif sep and key not in _NICOPTIONS and model is None:
             model, mac = key, val
     return model, mac
+
+
+_DRIVERE = re.compile(r'({})\d+$'.format('|'.join(_DRIVEBUSES)))
+# Slots for a new CD-ROM, PVE's default first.
+_CDROMSLOTS = ['ide2', 'ide0', 'ide1', 'ide3'] + ['sata{}'.format(n) for n in range(6)]
+
+
+def drive_options(text):
+    """(volume, {option: value}) from a drive value: 'local:iso/x.iso,media=cdrom'."""
+    volume, _, rest = (text or '').partition(',')
+    if volume.startswith('file='):
+        volume = volume[len('file='):]
+    opts = {}
+    for item in rest.split(','):
+        key, sep, val = item.partition('=')
+        if sep:
+            opts[key] = val
+    return volume, opts
+
+
+def cdrom_drives(cfg):
+    return sorted((k for k in cfg if _DRIVERE.match(k) and 'media=cdrom' in (cfg[k] or '')), key=_devkey)
+
+
+def disk_drives(cfg):
+    return sorted((k for k in cfg if _DRIVERE.match(k) and 'media=cdrom' not in (cfg[k] or '')), key=_devkey)
+
+
+def memory_mib(cfg):
+    # Plain MiB, or 'current=N,...' (PVE 8.1+).
+    text = str(cfg.get('memory', '512'))
+    if '=' in text:
+        text = dict(item.partition('=')[::2] for item in text.split(',')).get('current', '512')
+    return int(text)
+
+
+def simplify(name):
+    """Component name as used in confluent paths."""
+    return name.lower().replace(' ', '_')
+
+
+def tag_list(cfg):
+    return [tag for tag in re.split(r'[;, ]+', cfg.get('tags') or '') if tag]
+
+
+# nodeidentify: no LED on a VM, so a tag shown in the PVE UI.
+IDENTIFY_TAG = 'confluent-identify'
+
+_MIB = 1048576.0
+# name, status/current key, scale, units, valid while stopped.
+_SENSORS = (
+    ('CPU Usage', 'cpu', 100.0, '%', False),
+    ('CPUs', 'cpus', 1, None, True),
+    ('Memory Used', 'mem', 1 / _MIB, 'MiB', False),
+    ('Memory Total', 'maxmem', 1 / _MIB, 'MiB', True),
+    ('Disk Read', 'diskread', 1 / _MIB, 'MiB', False),
+    ('Disk Written', 'diskwrite', 1 / _MIB, 'MiB', False),
+    ('Network Received', 'netin', 1 / _MIB, 'MiB', False),
+    ('Network Sent', 'netout', 1 / _MIB, 'MiB', False),
+    ('Uptime', 'uptime', 1, 's', False),
+    # PVE 9+.
+    ('CPU Pressure', 'pressurecpusome', 1, '%', False),
+    ('Memory Pressure', 'pressurememorysome', 1, '%', False),
+    ('IO Pressure', 'pressureiosome', 1, '%', False),
+)
+
+
+def vm_sensors(status):
+    running = status.get('status') == 'running'
+    readings = []
+    for name, key, scale, units, static in _SENSORS:
+        if key not in status:
+            continue
+        reading = {'name': name, 'value': None, 'units': units, 'states': [], 'health': 'ok', 'type': 'VM'}
+        if running or static:
+            value = status[key]
+            try:
+                reading['value'] = round(float(value) * scale, 2)
+            except (TypeError, ValueError):
+                reading['states'] = ['Unavailable']
+        else:
+            reading['states'] = ['Unavailable']
+        readings.append(reading)
+    return readings
+
+
+# Unhealthy QEMU run states.
+_QMPHEALTH = {'paused': 'warning', 'io-error': 'critical', 'internal-error': 'critical',
+              'guest-panicked': 'critical'}
+
+
+def vm_health(status):
+    """(health, non-ok readings) from status/current."""
+    bad = []
+    if status.get('status') == 'running':
+        qmp = status.get('qmpstatus')
+        if qmp in _QMPHEALTH:
+            bad.append({'name': 'VM State', 'value': None, 'units': None, 'states': [qmp],
+                        'health': _QMPHEALTH[qmp], 'type': 'VM'})
+    hastate = (status.get('ha') or {}).get('state')
+    if hastate == 'error':
+        bad.append({'name': 'HA State', 'value': None, 'units': None, 'states': [hastate],
+                    'health': 'critical', 'type': 'VM'})
+    health = 'ok'
+    for reading in bad:
+        if reading['health'] == 'critical' or health == 'ok':
+            health = reading['health']
+    return health, bad
+
+
+_TASKNAMES = {
+    'qmstart': 'Start', 'qmstop': 'Stop', 'qmshutdown': 'Shutdown', 'qmreboot': 'Reboot',
+    'qmreset': 'Reset', 'qmsuspend': 'Suspend', 'qmresume': 'Resume', 'qmpause': 'Pause',
+    'qmigrate': 'Migrate', 'qmclone': 'Clone', 'qmcreate': 'Create', 'qmdestroy': 'Destroy',
+    'qmconfig': 'Configure', 'qmmove': 'Move disk', 'qmrestore': 'Restore', 'qmtemplate': 'Make template',
+    'qmsnapshot': 'Snapshot', 'qmdelsnapshot': 'Delete snapshot', 'qmrollback': 'Roll back snapshot',
+    'vzdump': 'Backup', 'vncproxy': 'VNC console', 'termproxy': 'Serial console',
+    'hamigrate': 'HA migrate', 'hastart': 'HA start', 'hastop': 'HA stop',
+}
+
+
+def task_event(task):
+    """Event log entry from a PVE task list item."""
+    status = task.get('status') or 'running'
+    if status in ('OK', 'running'):
+        severity = 'ok'
+    elif status.startswith('WARNINGS'):
+        severity = 'warning'
+    else:
+        severity = 'critical'
+    name = _TASKNAMES.get(task.get('type'), task.get('type'))
+    return {
+        'severity': severity,
+        'timestamp': time.strftime('%Y-%m-%dT%H:%M:%S', time.localtime(int(task.get('starttime', 0)))),
+        'event': '{}: {}'.format(name, status),
+        'message': '{} by {} on {}'.format(name, task.get('user'), task.get('node')),
+        'component': 'VM {}'.format(task.get('id')),
+        'component_type': 'Task',
+        'id': task.get('type'),
+        'record_id': task.get('upid'),
+        'log_id': 'tasks',
+    }
+
+
+def agent_enabled(cfg):
+    # '1', '1,fstrim_cloned_disks=1' or 'enabled=1,...'.
+    first = str(cfg.get('agent', '0')).split(',')[0]
+    return first.partition('=')[2] == '1' if '=' in first else first == '1'
+
+
+def vm_inventory(cfg, host, vmid, guest=None):
+    """nodeinventory items from the config; guest: agent {'os', 'interfaces'} or {'error'}."""
+    smbios = parse_smbios1(cfg.get('smbios1', ''))
+    info = {
+        'Product name': 'Proxmox qemu virtual machine',
+        'Manufacturer': 'qemu',
+    }
+    for field, label in _SMBIOSFIELDS:
+        if smbios.get(field):
+            info[label] = smbios[field]
+    info['Model'] = info['Product name']
+    info['Proxmox node'] = host
+    info['VM ID'] = vmid
+    items = [{'name': 'System', 'present': True, 'information': info}]
+    cputype = (cfg.get('cpu') or 'kvm64').split(',')[0]
+    if cputype.startswith('cputype='):
+        cputype = cputype[len('cputype='):]
+    sockets, cores = int(cfg.get('sockets', 1)), int(cfg.get('cores', 1))
+    items.append({'name': 'CPU', 'present': True, 'information': {
+        'Model': cputype, 'Sockets': sockets, 'Cores per socket': cores,
+        'vCPUs': int(cfg.get('vcpus') or sockets * cores)}})
+    items.append({'name': 'Memory', 'present': True, 'information': {
+        'Size (MiB)': memory_mib(cfg), 'Balloon minimum (MiB)': cfg.get('balloon')}})
+    guest = guest or {}
+    addrsbymac = {}
+    for iface in guest.get('interfaces') or []:
+        mac = (iface.get('hardware-address') or '').lower()
+        addrs = ['{}/{}'.format(a['ip-address'], a.get('prefix')) for a in iface.get('ip-addresses') or []
+                 if a.get('ip-address') and not a['ip-address'].startswith(('127.', '::1', 'fe80:'))]
+        if mac and addrs:
+            addrsbymac.setdefault(mac, []).extend(addrs)
+    for key in sorted((k for k in cfg if re.match(r'net\d+$', k)), key=_devkey):
+        model, mac = parse_nic(cfg[key])
+        info = {'Type': 'Ethernet', 'Model': model, 'MAC Address 1': mac}
+        if addrsbymac.get((mac or '').lower()):
+            info['IP Addresses'] = ', '.join(addrsbymac[mac.lower()])
+        items.append({'name': 'Network adapter {}'.format(key), 'present': True, 'information': info})
+    if guest.get('os'):
+        osinfo = guest['os']
+        items.append({'name': 'Guest OS', 'present': True, 'information': {
+            'Name': osinfo.get('pretty-name') or osinfo.get('name'), 'Version': osinfo.get('version'),
+            'Kernel': osinfo.get('kernel-release'), 'Architecture': osinfo.get('machine')}})
+    elif guest.get('error'):
+        items.append({'name': 'Guest OS', 'present': False, 'information': {
+            'Status': 'QEMU guest agent: {}'.format(guest['error'])}})
+    for key in disk_drives(cfg):
+        volume, opts = drive_options(cfg[key])
+        items.append({'name': 'Disk {}'.format(key), 'present': True, 'information': {
+            'Type': 'Disk', 'Volume': volume, 'Size': opts.get('size'), 'Serial Number': opts.get('serial')}})
+    for key in cdrom_drives(cfg):
+        volume, _ = drive_options(cfg[key])
+        items.append({'name': 'CD-ROM {}'.format(key), 'present': True, 'information': {
+            'Type': 'CD-ROM', 'Media': None if volume == 'none' else volume}})
+    if cfg.get('tpmstate0'):
+        volume, opts = drive_options(cfg['tpmstate0'])
+        items.append({'name': 'TPM', 'present': True, 'information': {
+            'Version': opts.get('version', 'v1.2'), 'Volume': volume}})
+    return items
+
+
+# nodeconfig name -> (PVE key, PVE default, possible values, help).
+_OSTYPES = ['other', 'wxp', 'w2k', 'w2k3', 'w2k8', 'wvista', 'win7', 'win8', 'win10', 'win11',
+            'l24', 'l26', 'solaris']
+SYSTEMSETTINGS = {
+    'cores': ('cores', '1', None, 'CPU cores per socket'),
+    'sockets': ('sockets', '1', None, 'CPU sockets'),
+    'vcpus': ('vcpus', '', None, 'vCPUs plugged at start (empty: sockets x cores)'),
+    'cpu': ('cpu', 'kvm64', None, 'Emulated CPU type, with optional flags'),
+    'memory': ('memory', '512', None, 'Memory in MiB'),
+    'balloon': ('balloon', '', None, 'Balloon target minimum in MiB; 0 disables the balloon device'),
+    'numa': ('numa', '0', ['0', '1'], 'NUMA topology'),
+    'bios': ('bios', 'seabios', ['seabios', 'ovmf'],
+             'Firmware. Changing it under an installed OS usually leaves it unbootable'),
+    'machine': ('machine', '', None, 'QEMU machine type (empty: newest i440fx)'),
+    'ostype': ('ostype', 'other', _OSTYPES, 'Guest OS type, for PVE-side optimisations'),
+    'onboot': ('onboot', '0', ['0', '1'], 'Start with the Proxmox node'),
+    'agent': ('agent', '0', None, 'QEMU guest agent (1, or 1,fstrim_cloned_disks=1, ...)'),
+    'tablet': ('tablet', '1', ['0', '1'], 'USB tablet for absolute pointer'),
+    'protection': ('protection', '0', ['0', '1'], 'Refuse removal of the VM and its disks'),
+}
+TPMVERSIONS = ['none', 'v1.2', 'v2.0']
+
+
+def system_settings(nextcfg, curcfg):
+    """value: as of the next start; active: now."""
+    settings = {}
+    for name, (key, default, possible, helptext) in SYSTEMSETTINGS.items():
+        setting = {'value': str(nextcfg.get(key, default)), 'active': str(curcfg.get(key, default)),
+                   'default': default, 'help': helptext}
+        if possible:
+            setting['possible'] = possible
+        settings[name] = setting
+    tpm = [drive_options(cfg.get('tpmstate0'))[1].get('version', 'v1.2') if cfg.get('tpmstate0') else 'none'
+           for cfg in (nextcfg, curcfg)]
+    settings['tpm'] = {'value': tpm[0], 'active': tpm[1], 'default': 'none', 'possible': TPMVERSIONS,
+                       'help': 'TPM state device. Removing it destroys the keys it holds'}
+    secure = []
+    for cfg in (nextcfg, curcfg):
+        if cfg.get('bios') != 'ovmf':
+            secure.append('n/a')
+        elif drive_options(cfg.get('efidisk0'))[1].get('pre-enrolled-keys') == '1':
+            secure.append('enabled')
+        else:
+            secure.append('disabled')
+    settings['secure_boot'] = {
+        'value': secure[0], 'active': secure[1], 'default': 'n/a',
+        'help': 'UEFI Secure Boot (EFI disk with pre-enrolled keys). Read only: changing it means '
+                'recreating the EFI disk'}
+    return settings
 
 
 class TaskFailed(Exception):
@@ -381,6 +646,7 @@ class PmxApiClient:
         self.vmdupes = {}
         self.vmlist = {}
         self.vmbyid = {}
+        self.pvenodes = []
         self.logged = False
 
     @property
@@ -458,6 +724,8 @@ class PmxApiClient:
         resources = await self.api('GET', '/api2/json/cluster/resources')
         # Names need not be unique; templates are skipped.
         byname = {}
+        self.pvenodes = sorted(datum['node'] for datum in resources or []
+                               if datum['type'] == 'node' and datum.get('status') != 'offline')
         for datum in resources or []:
             if datum['type'] == 'qemu' and not datum.get('template'):
                 byname.setdefault(datum.get('name'), []).append((datum['node'], datum['id']))
@@ -478,30 +746,353 @@ class PmxApiClient:
         return self.vmmap[vm]
 
 
-    async def get_vm_inventory(self, vm):
+    async def get_vm_inventory(self, vm, component='all'):
         # Current config: pending NICs are not present yet.
         cfg = await self.api('GET', 'config', vm=vm)
-        info = {
-            'Product name': 'Proxmox qemu virtual machine',
-            'Manufacturer': 'qemu',
-            }
-        smbios = parse_smbios1(cfg.get('smbios1', ''))
-        for field, label in _SMBIOSFIELDS:
-            if smbios.get(field):
-                info[label] = smbios[field]
-        invitems = [{'name': 'System', 'present': True, 'information': info}]
-        for key in sorted((k for k in cfg if re.match(r'net\d+$', k)), key=_devkey):
-            model, mac = parse_nic(cfg[key])
-            invitems.append({
-                'present': True,
-                'name': 'Network adapter {}'.format(key),
-                'information': {
-                    'Type': 'Ethernet',
-                    'Model': model,
-                    'MAC Address 1': mac,
-                    }
-                })
+        host, guest = await self.get_vm(vm)
+        guestinfo = None
+        if component in ('all', 'guest_os') or component.startswith('network'):
+            guestinfo = await self.get_guest_info(vm, cfg)
+        invitems = vm_inventory(cfg, host, guest.split('/')[-1], guestinfo)
+        if component != 'all':
+            invitems = [item for item in invitems if component in (item['name'], simplify(item['name']))]
         yield msg.KeyValueData({'inventory': invitems}, vm)
+
+    async def get_guest_info(self, vm, cfg):
+        """Guest agent OS and interfaces; None if no agent or VM off, {'error'} if it fails.
+
+        Needs VM.GuestAgent.Audit (PVE 9) or VM.Monitor (PVE 8).
+        """
+        if not agent_enabled(cfg) or await self.get_vm_power(vm) != 'on':
+            return None
+        info = {}
+        try:
+            info['os'] = ((await self.api('GET', 'agent/get-osinfo', vm=vm)) or {}).get('result')
+            info['interfaces'] = ((await self.api('GET', 'agent/network-get-interfaces', vm=vm)) or {}).get('result')
+        except exc.TargetResourceUnavailable as e:
+            # e.g. 'HTTP 500: QEMU guest agent is not running'.
+            return {'error': 'HTTP ' + str(e).split(': HTTP ', 1)[-1]}
+        return info
+
+    # Most recent task logs to include.
+    servicedata_tasklogs = 25
+
+    async def collect_servicedata(self, vm, filename, progress, data=None):
+        """nodesupport servicedata: config, pending, status, agent, tasks and task logs.
+
+        Writes <filename>.tar.gz; returns the path.
+        """
+        if not filename.endswith(('.tar.gz', '.tgz')):
+            filename += '.tar.gz'
+        if os.path.exists(filename):
+            raise exc.InvalidArgumentException('{} already exists, cannot overwrite'.format(filename))
+        host, guest = await self.get_vm(vm)
+        vmid = guest.split('/')[-1]
+        members = {}
+        members['config.json'] = await self.api('GET', 'config', vm=vm)
+        members['pending.json'] = await self.api('GET', 'pending', vm=vm)
+        members['status.json'] = await self.get_vm_status(vm)
+        members['guest-agent.json'] = await self.get_guest_info(vm, members['config.json'])
+        members['version.json'] = await self.api('GET', '/api2/json/version')
+        progress({'phase': 'download', 'progress': 10.0})
+        tasks = []
+        for pvenode in self.pvenodes or [host]:
+            try:
+                tasks.extend(t for t in await self.api(
+                    'GET', '/api2/json/nodes/{}/tasks?vmid={}&limit=500&source=all'.format(pvenode, vmid)) or []
+                    if str(t.get('id')) == vmid)
+            except exc.TargetResourceUnavailable as e:
+                if pvenode == host:
+                    raise
+                tasks.append({'node': pvenode, 'error': str(e)})
+        tasks.sort(key=lambda task: int(task.get('starttime', 0)))
+        members['tasks.json'] = tasks
+        recent = [t for t in tasks if t.get('upid')][-self.servicedata_tasklogs:]
+        for num, task in enumerate(recent):
+            lines = await self.api('GET', '/api2/json/nodes/{}/tasks/{}/log?limit=5000'.format(
+                task['node'], urlparse.quote(task['upid'], safe='')))
+            name = 'tasklogs/{}-{}-{}.log'.format(task.get('starttime'), task.get('type'), task['node'])
+            members[name] = '\n'.join(line.get('t', '') for line in lines or []) + '\n'
+            progress({'phase': 'download', 'progress': 10.0 + 85.0 * (num + 1) / len(recent)})
+
+        def write():
+            topdir = '{}-pve-{}'.format(vm, time.strftime('%Y%m%dT%H%M%S'))
+            with tarfile.open(filename, 'w:gz') as tar:
+                for name, content in members.items():
+                    if not isinstance(content, str):
+                        content = json.dumps(content, indent=2, sort_keys=True) + '\n'
+                    blob = content.encode('utf8')
+                    info = tarfile.TarInfo('{}/{}'.format(topdir, name))
+                    info.size = len(blob)
+                    info.mtime = int(time.time())
+                    tar.addfile(info, io.BytesIO(blob))
+        await asyncio.to_thread(write)
+        return filename
+
+    async def get_vm_status(self, vm):
+        return await self.api('GET', 'status/current', vm=vm)
+
+    async def get_vm_firmware(self, vm):
+        cfg = await self.api('GET', 'config', vm=vm)
+        status = await self.get_vm_status(vm)
+        version = await self.api('GET', '/api2/json/version')
+        running = status.get('status') == 'running'
+        return [
+            {'BIOS': {'version': 'OVMF (UEFI)' if cfg.get('bios') == 'ovmf' else 'SeaBIOS'}},
+            {'QEMU': {'version': status.get('running-qemu') if running else None}},
+            {'Machine type': {'version': (status.get('running-machine') if running else None)
+                              or cfg.get('machine') or 'pc (newest i440fx)'}},
+            {'Proxmox VE': {'version': (version or {}).get('version')}},
+        ]
+
+    async def get_vm_events(self, vm):
+        """Task history from every cluster node (migrated VMs span several).
+
+        Without Sys.Audit, PVE lists only the caller's own tasks.
+        """
+        host, guest = await self.get_vm(vm)
+        vmid = guest.split('/')[-1]
+        events = []
+        for pvenode in self.pvenodes or [host]:
+            try:
+                tasklist = await self.api('GET', '/api2/json/nodes/{}/tasks?vmid={}&limit=500&source=all'.format(
+                    pvenode, vmid))
+            except exc.TargetResourceUnavailable:
+                if pvenode == host:
+                    raise
+                continue
+            events.extend(task for task in tasklist or [] if str(task.get('id')) == vmid)
+        events.sort(key=lambda task: int(task.get('starttime', 0)))
+        return [task_event(task) for task in events]
+
+    async def get_vm_location(self, vm):
+        host, guest = await self.get_vm(vm)
+        return {'manager': self.server, 'pve_node': host, 'vmid': guest.split('/')[-1]}
+
+    async def get_vm_identify(self, vm):
+        cfg = await self.api('GET', 'config', vm=vm)
+        return 'on' if IDENTIFY_TAG in tag_list(cfg) else 'off'
+
+    async def set_vm_identify(self, vm, state):
+        if state not in ('on', 'off', 'blink'):
+            raise exc.InvalidArgumentException('Unsupported identify state {}'.format(state))
+        cfg = await self.api('GET', 'config', vm=vm)
+        tags = tag_list(cfg)
+        want = state != 'off'
+        if (IDENTIFY_TAG in tags) == want:
+            return
+        tags = [tag for tag in tags if tag != IDENTIFY_TAG] + ([IDENTIFY_TAG] if want else [])
+        await self.api('PUT', 'config', {'tags': ';'.join(tags)} if tags else {'delete': 'tags'}, vm=vm)
+
+    async def reseat_vm(self, vm):
+        # Hard off, then on; a cold start applies pending config.
+        if await self.get_vm_power(vm) == 'on':
+            await self.set_vm_power(vm, 'off')
+        await self.set_vm_power(vm, 'on')
+
+    async def wait_task(self, host, upid, timeout):
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + timeout
+        while True:
+            task = await self.api('GET', '/api2/json/nodes/{}/tasks/{}/status'.format(
+                host, urlparse.quote(upid, safe='')))
+            if task.get('status') == 'stopped':
+                exitstatus = task.get('exitstatus') or ''
+                if exitstatus != 'OK' and not exitstatus.startswith('WARNINGS'):
+                    raise TaskFailed('PVE task {} failed: {}'.format(
+                        upid.split(':')[5] if upid.count(':') > 5 else upid, exitstatus))
+                return
+            if loop.time() >= deadline:
+                raise exc.TargetResourceUnavailable('PVE task {} still running after {} seconds'.format(
+                    upid, timeout))
+            await asyncio.sleep(1)
+
+    # nodemedia: virtual CD-ROMs.
+
+    async def get_vm_media(self, vm):
+        cfg = next_config(await self.api('GET', 'pending', vm=vm))
+        media = []
+        for key in cdrom_drives(cfg):
+            volume, _ = drive_options(cfg[key])
+            if volume == 'none':
+                continue
+            location, sep, name = volume.rpartition('/')
+            media.append({'name': name, 'url': location if sep else None, 'secure': True})
+        return media
+
+    async def iso_storage(self, host):
+        """First active ISO storage on host."""
+        stores = await self.api('GET', '/api2/json/nodes/{}/storage?content=iso&enabled=1'.format(host))
+        for store in sorted(stores or [], key=lambda s: s['storage']):
+            if store.get('active', 1):
+                return store['storage']
+        # PVE lists only storages the user can audit.
+        raise exc.InvalidArgumentException(
+            'No active storage for ISO images (content type iso) on Proxmox node {} is visible to {}; '
+            'it needs Datastore.Audit on that storage'.format(host, self.user))
+
+    async def attach_media(self, vm, url):
+        """Insert url in the CD-ROM: http(s)/ftp is downloaded to ISO storage
+        (reused if present); pve://storage:path is an existing volume.
+
+        The confluent input check treats anything without '://' as a local file.
+        """
+        if url.startswith('pve://'):
+            url = url[len('pve://'):]
+        if re.match(r'(https?|ftp)://', url):
+            host, _ = await self.get_vm(vm)
+            storage = await self.iso_storage(host)
+            name = urlparse.unquote(urlparse.urlsplit(url).path.rsplit('/', 1)[-1])
+            if not re.match(r'[\w.+-]+\.(iso|img)$', name, re.I):
+                raise exc.InvalidArgumentException(
+                    'The URL must name an .iso or .img file, as Proxmox stores it under that name: {}'.format(url))
+            volid = '{}:iso/{}'.format(storage, name)
+            content = await self.api('GET', '/api2/json/nodes/{}/storage/{}/content?content=iso'.format(
+                host, storage))
+            if volid not in [item.get('volid') for item in content or []]:
+                try:
+                    upid = await self.api('POST', '/api2/json/nodes/{}/storage/{}/download-url'.format(
+                        host, storage), {'content': 'iso', 'filename': name, 'url': url})
+                except exc.TargetResourceUnavailable as e:
+                    if 'HTTP 403' not in str(e):
+                        raise
+                    # PVE's 403 does not say which right (PVE 9.2).
+                    raise exc.TargetResourceUnavailable(
+                        '{} may not download to {}: that needs Datastore.AllocateTemplate on the storage '
+                        'and both Sys.Audit and Sys.Modify on / ({})'.format(self.user, storage, e))
+                await self.wait_task(host, upid, 3600)
+        elif re.match(r'[\w.-]+:[^/]', url):
+            volid = url
+        else:
+            raise exc.InvalidArgumentException(
+                'Proxmox media must be an http(s) or ftp URL, or a volume (pve://storage:iso/name.iso); '
+                'use nodemedia upload for a local file')
+        await self.insert_cdrom(vm, volid)
+
+    async def insert_cdrom(self, vm, volid):
+        cfg = next_config(await self.api('GET', 'pending', vm=vm))
+        drives = cdrom_drives(cfg)
+        if drives:
+            slot = drives[0]
+        else:
+            free = [slot for slot in _CDROMSLOTS if slot not in cfg]
+            if not free:
+                raise exc.InvalidArgumentException('{} has no CD-ROM and no free IDE/SATA slot'.format(vm))
+            slot = free[0]
+        await self.api('PUT', 'config', {slot: '{},media=cdrom'.format(volid)}, vm=vm)
+        if not drives and await self.get_vm_power(vm) == 'on':
+            log.log({'info': '{}: added CD-ROM {} with {}; a running VM sees it after its next cold '
+                             'start'.format(vm, slot, volid)})
+
+    async def detach_media(self, vm):
+        cfg = next_config(await self.api('GET', 'pending', vm=vm))
+        update = {}
+        for key in cdrom_drives(cfg):
+            if drive_options(cfg[key])[0] != 'none':
+                update[key] = 'none,media=cdrom'
+        if update:
+            await self.api('PUT', 'config', update, vm=vm)
+
+    async def upload_media(self, vm, filename, progress, data=None):
+        """nodemedia upload: stream a local image to ISO storage, then insert it."""
+        host, _ = await self.get_vm(vm)
+        storage = await self.iso_storage(host)
+        if not self.logged:
+            await self.login()
+        name = os.path.basename(filename)
+        fileobj = data if data is not None else open(filename, 'rb')
+        try:
+            fileobj.seek(0, 2)
+            size = fileobj.tell()
+            fileobj.seek(0)
+            boundary = secrets.token_hex(16)
+            head = ('--{0}\r\nContent-Disposition: form-data; name="content"\r\n\r\niso\r\n'
+                    '--{0}\r\nContent-Disposition: form-data; name="filename"; filename="{1}"\r\n'
+                    'Content-Type: application/octet-stream\r\n\r\n').format(boundary, name).encode()
+            tail = '\r\n--{0}--\r\n'.format(boundary).encode()
+
+            async def body():
+                yield head
+                sent = 0
+                while True:
+                    chunk = await asyncio.to_thread(fileobj.read, 1 << 20)
+                    if not chunk:
+                        break
+                    sent += len(chunk)
+                    progress({'phase': 'upload', 'progress': 100.0 * sent / size if size else 100.0})
+                    yield chunk
+                yield tail
+            headers = dict(self.wc.stdheaders)
+            headers['Content-Type'] = 'multipart/form-data; boundary=' + boundary
+            headers['Content-Length'] = str(len(head) + size + len(tail))
+            url = 'https://{}:8006/api2/json/nodes/{}/storage/{}/upload'.format(self.wc.host, host, storage)
+            async with aiohttp.ClientSession(cookie_jar=self.wc.cookies,
+                                             timeout=aiohttp.ClientTimeout(total=None)) as session:
+                async with session.post(url, data=body(), headers=headers, ssl=self.wc.ssl) as rsp:
+                    rspbody = await rsp.read()
+                    if rsp.status != 200:
+                        raise exc.TargetResourceUnavailable('Upload of {} to {} on {} failed: {}'.format(
+                            name, storage, host, pve_error(rspbody, rsp.status)))
+                    upid = json.loads(rspbody).get('data')
+        finally:
+            fileobj.close()
+        if upid:
+            # Task moves the upload into the storage.
+            await self.wait_task(host, upid, 600)
+        await self.insert_cdrom(vm, '{}:iso/{}'.format(storage, name))
+
+    # nodeconfig: VM settings.
+
+    async def get_vm_settings(self, vm):
+        nextcfg = next_config(await self.api('GET', 'pending', vm=vm))
+        curcfg = await self.api('GET', 'config', vm=vm)
+        return system_settings(nextcfg, curcfg)
+
+    async def set_vm_settings(self, vm, changes):
+        update = {}
+        delete = []
+        for name, value in changes.items():
+            value = '' if value is None else str(value)
+            if name == 'tpm':
+                await self.set_vm_tpm(vm, value)
+                continue
+            if name == 'secure_boot':
+                raise exc.InvalidArgumentException(
+                    'secure_boot is read only: it is set by the keys enrolled on the EFI disk')
+            if name not in SYSTEMSETTINGS:
+                raise exc.InvalidArgumentException('{} is not a Proxmox VM setting; settable: {}'.format(
+                    name, ', '.join(sorted(list(SYSTEMSETTINGS) + ['tpm']))))
+            key, _, possible, _ = SYSTEMSETTINGS[name]
+            if value == '':
+                delete.append(key)
+            elif possible and value not in possible:
+                raise exc.InvalidArgumentException('{} must be one of {}'.format(name, ', '.join(possible)))
+            else:
+                update[key] = value
+        if delete:
+            update['delete'] = ','.join(delete)
+        if update:
+            await self.api('PUT', 'config', update, vm=vm)
+
+    async def set_vm_tpm(self, vm, version):
+        if version not in TPMVERSIONS:
+            raise exc.InvalidArgumentException('tpm must be one of {}'.format(', '.join(TPMVERSIONS)))
+        cfg = next_config(await self.api('GET', 'pending', vm=vm))
+        current = drive_options(cfg['tpmstate0'])[1].get('version', 'v1.2') if cfg.get('tpmstate0') else 'none'
+        if version == current:
+            return
+        if version == 'none':
+            await self.api('PUT', 'config', {'delete': 'tpmstate0'}, vm=vm)
+            return
+        if current != 'none':
+            raise exc.InvalidArgumentException(
+                '{} already has a {} TPM; set tpm=none first (this destroys its keys)'.format(vm, current))
+        # TPM state on the EFI disk's storage, else the first disk's.
+        source = cfg.get('efidisk0') or next((cfg[k] for k in disk_drives(cfg)), None)
+        if not source or ':' not in source:
+            raise exc.InvalidArgumentException('{} has no disk storage to put a TPM state on'.format(vm))
+        storage = drive_options(source)[0].split(':', 1)[0]
+        await self.api('PUT', 'config', {'tpmstate0': '{}:1,version={}'.format(storage, version)}, vm=vm)
 
 
     async def get_vm_ikvm(self, vm):
@@ -546,15 +1137,51 @@ class PmxApiClient:
         raise exc.TargetResourceUnavailable(
             'Unknown power status {!r} (qmpstatus {!r}) for {}'.format(currstatus, rsp.get('qmpstatus'), vm))
 
+    async def get_vm_powerstate(self, vm):
+        """on, off, paused, suspended (to RAM) or hibernated (to disk)."""
+        rsp = await self.get_vm_status(vm)
+        if rsp.get('status') == 'running':
+            return {'paused': 'paused', 'suspended': 'suspended'}.get(rsp.get('qmpstatus'), 'on')
+        if rsp.get('status') == 'stopped':
+            return 'hibernated' if rsp.get('lock') == 'suspended' else 'off'
+        return await self.get_vm_power(vm)
+
+    async def inject_nmi(self, vm):
+        if await self.get_vm_power(vm) != 'on':
+            raise exc.InvalidArgumentException('{} is not running; an NMI needs a running VM'.format(vm))
+        try:
+            await self.api('POST', 'monitor', {'command': 'nmi'}, vm=vm)
+        except exc.TargetResourceUnavailable as e:
+            # 'nmi' is root@pam only (PVE 9); other non-info commands need Sys.Modify on /.
+            if 'HTTP 403' in str(e) or 'root-only' in str(e):
+                raise exc.TargetResourceUnavailable(
+                    'diag sends an NMI through the QEMU monitor, which Proxmox allows for root@pam '
+                    'only: {}'.format(e))
+            raise
+
     # Seconds per action; shutdown waits on the guest's ACPI handling.
     power_timeout = {'start': 60, 'stop': 60, 'shutdown': 300}
 
     async def set_vm_power(self, vm, state):
         current = None
         if state == 'diag':
-            raise exc.InvalidArgumentException('Proxmox VMs have no diagnostic interrupt')
+            await self.inject_nmi(vm)
+            return 'diag', None
         if state not in ('on', 'off', 'shutdown', 'boot', 'reset'):
             raise exc.InvalidArgumentException('Unsupported power state {}'.format(state))
+        if state == 'on':
+            current = await self.get_vm_powerstate(vm)
+            if current in ('paused', 'suspended'):
+                # PVE refuses start on a paused/suspended VM.
+                host, _ = await self.get_vm(vm)
+                upid = await self.api('POST', 'status/resume', vm=vm)
+                try:
+                    await self.wait_task(host, upid, self.power_timeout['start'])
+                except TaskFailed as e:
+                    raise exc.TargetResourceUnavailable(str(e))
+                return 'on', current
+            # Hibernated: start resumes from disk.
+            current = None
         if state == 'boot':
             current = await self.get_vm_power(vm)
             action = 'reset' if current == 'on' else 'start'
@@ -578,7 +1205,9 @@ class PmxApiClient:
         target = 'on' if action == 'start' else 'off'
         # Retry a task that lost the config lock race.
         for attempt in range(3):
-            upid = await self.api('POST', f'status/{action}', vm=vm)
+            # PVE's own shutdown timeout is shorter.
+            params = {'timeout': self.power_timeout['shutdown']} if action == 'shutdown' else None
+            upid = await self.api('POST', f'status/{action}', params, vm=vm)
             try:
                 return await self.wait_power(vm, target, self.power_timeout[action], upid), current
             except TaskFailed as e:
@@ -599,8 +1228,8 @@ class PmxApiClient:
                 task = await self.api('GET', '/api2/json/nodes/{}/tasks/{}/status'.format(
                     host, urlparse.quote(upid, safe='')))
                 if task.get('status') == 'stopped' and task.get('exitstatus') != 'OK':
-                    raise TaskFailed('{}: PVE task {} failed: {}'.format(
-                        vm, upid.split(':')[5] if upid.count(':') > 5 else 'action', task.get('exitstatus')))
+                    raise TaskFailed('PVE task {} failed: {}'.format(
+                        upid.split(':')[5] if upid.count(':') > 5 else 'action', task.get('exitstatus')))
             if loop.time() >= deadline:
                 raise exc.TargetResourceUnavailable(
                     '{} did not reach power state {} within {} seconds'.format(vm, target, timeout))
@@ -685,7 +1314,13 @@ async def prep_proxmox_clients(nodes, configmanager):
         clientsbynode[node] = clientsbypmx[currpmx]
     return clientsbynode
 
-async def retrieve(nodes, element, configmanager, inputdata):
+
+def _unsupported(node, element):
+    return msg.ConfluentNodeError(node, '{} is not supported for Proxmox VMs'.format('/'.join(element)))
+
+
+async def _per_node(nodes, element, configmanager, handler):
+    """Run handler(client, node) per node; errors are reported per node."""
     clientsbynode = await prep_proxmox_clients(nodes, configmanager)
     for node in nodes:
         currclient = clientsbynode[node]
@@ -697,57 +1332,168 @@ async def retrieve(nodes, element, configmanager, inputdata):
         except Exception as e:
             yield msg.ConfluentNodeError(node, str(e))
             continue
-        if element == ['power', 'state']:
-            yield msg.PowerState(node, await currclient.get_vm_power(node))
-        elif element == ['boot', 'nextdevice']:
-            nextdev, bootmode, persistent = await currclient.get_vm_bootdev(node)
-            yield msg.BootDevice(node, nextdev, bootmode=bootmode, persistent=persistent)
-        elif element[:2] == ['inventory', 'hardware'] and len(element) == 4:
-            async for rsp in currclient.get_vm_inventory(node):
+        try:
+            async for rsp in handler(currclient, node):
                 yield rsp
-        elif element == ['console', 'ikvm_methods']:
-            dsc = {'ikvm_methods': ['vnc']}
-            yield msg.KeyValueData(dsc, node)
-        elif element == ['console', 'ikvm_screenshot']:
-            # good background for the webui, and kitty
-            yield msg.ConfluentNodeError(node, "vnc available, screenshot not available")
-        elif element == ['health', 'hardware']:
-            yield msg.HealthSummary('unknown', node)
-            yield msg.SensorReadings([], node)
+        except (exc.ConfluentException, TaskFailed) as e:
+            yield msg.ConfluentNodeError(node, str(e))
+
+
+async def _inventory_items(client, node):
+    cfg = await client.api('GET', 'config', vm=node)
+    host, guest = await client.get_vm(node)
+    return vm_inventory(cfg, host, guest.split('/')[-1], await client.get_guest_info(node, cfg))
+
+
+async def _retrieve_node(client, node, element):
+    if element == ['power', 'state']:
+        yield msg.PowerState(node, await client.get_vm_powerstate(node))
+    elif element == ['boot', 'nextdevice']:
+        nextdev, bootmode, persistent = await client.get_vm_bootdev(node)
+        yield msg.BootDevice(node, nextdev, bootmode=bootmode, persistent=persistent)
+    elif element[:2] == ['inventory', 'hardware'] and len(element) == 3:
+        yield msg.ChildCollection('all')
+        for item in await _inventory_items(client, node):
+            yield msg.ChildCollection(simplify(item['name']))
+    elif element[:2] == ['inventory', 'hardware'] and len(element) == 4:
+        async for rsp in client.get_vm_inventory(node, element[3]):
+            yield rsp
+    elif element[:2] == ['inventory', 'firmware']:
+        if len(element) < 3 or element[2] not in ('all', 'core', 'adapters', 'disks', 'misc'):
+            yield _unsupported(node, element)
+            return
+        items = await client.get_vm_firmware(node) if element[2] in ('all', 'core') else []
+        if len(element) == 3:
+            yield msg.ChildCollection('all')
+            for item in items:
+                for name in item:
+                    yield msg.ChildCollection(simplify(name))
+            return
+        if element[3] != 'all':
+            items = [item for item in items if element[3] in [simplify(name) for name in item] + list(item)]
+        yield msg.Firmware(items, node)
+    elif element == ['health', 'hardware']:
+        health, bad = vm_health(await client.get_vm_status(node))
+        yield msg.HealthSummary(health, node)
+        yield msg.SensorReadings(bad, node)
+    elif element[:2] == ['sensors', 'hardware'] and len(element) >= 3:
+        if element[2] == 'normalized':
+            yield _unsupported(node, element)
+            return
+        # No temperature, fan, power or energy sensors on a VM.
+        readings = vm_sensors(await client.get_vm_status(node)) if element[2] == 'all' else []
+        if len(element) == 3:
+            yield msg.ChildCollection('all')
+            for reading in readings:
+                yield msg.ChildCollection(simplify(reading['name']))
+            return
+        if element[3] != 'all':
+            readings = [r for r in readings if simplify(r['name']) == element[3]]
+        yield msg.SensorReadings(readings, node)
+    elif element == ['events', 'hardware', 'log']:
+        yield msg.EventCollection(await client.get_vm_events(node), node)
+    elif element == ['identify']:
+        yield msg.IdentifyState(node, await client.get_vm_identify(node))
+    elif element == ['media', 'current']:
+        for media in await client.get_vm_media(node):
+            yield msg.Media(node, rawmedia=media)
+    elif element[:2] == ['configuration', 'system'] and element[2:] in (['all'], ['advanced']):
+        yield msg.ConfigSet(node, await client.get_vm_settings(node))
+    elif element[:3] == ['configuration', 'management_controller', 'extended']:
+        # Manager, current PVE node and VMID.
+        settings = {}
+        if element[3:] == ['all']:
+            settings = dict((key, {'value': val}) for key, val in (await client.get_vm_location(node)).items())
+        yield msg.ConfigSet(node, settings)
+    elif element == ['configuration', 'management_controller', 'location']:
+        yield msg.KeyValueData(await client.get_vm_location(node), node)
+    elif element == ['configuration', 'management_controller', 'net_interfaces']:
+        yield msg.ChildCollection('management')
+    elif element == ['configuration', 'management_controller', 'net_interfaces', 'management']:
+        # No management controller.
+        yield msg.NetworkConfiguration(name=node)
+    elif element == ['configuration', 'management_controller', 'hostname']:
+        yield msg.Hostname(node, None)
+    elif element[:2] == ['configuration', 'storage'] and len(element) >= 3:
+        if element[2] not in ('all', 'disks'):
+            return
+        cfg = await client.api('GET', 'config', vm=node)
+        disks = disk_drives(cfg)
+        if element[2] == 'disks' and len(element) == 3:
+            for key in disks:
+                yield msg.ChildCollection(key)
+            return
+        if element[2] == 'disks':
+            disks = [key for key in disks if key == element[3]]
+        for key in disks:
+            volume, opts = drive_options(cfg[key])
+            yield msg.Disk(node, label=key, description='{} ({})'.format(volume, opts.get('size', 'size unknown')),
+                           diskid=key, state='online', serial=opts.get('serial'))
+    elif element == ['console', 'ikvm_methods']:
+        yield msg.KeyValueData({'ikvm_methods': ['vnc']}, node)
+    elif element == ['console', 'ikvm_screenshot']:
+        # good background for the webui, and kitty
+        yield msg.ConfluentNodeError(node, "vnc available, screenshot not available")
+    else:
+        yield _unsupported(node, element)
+
+
+_TRANSFERS = (('media/uploads', 'mediaupload'), ('support/servicedata', 'ffdc'))
+
+
+async def retrieve(nodes, element, configmanager, inputdata):
+    for prefix, kind in _TRANSFERS:
+        if '/'.join(element).startswith(prefix):
+            for ret in firmwaremanager.list_updates(nodes, configmanager.tenant, element, kind):
+                yield ret
+            return
+    async for rsp in _per_node(nodes, element, configmanager,
+                               lambda client, node: _retrieve_node(client, node, element)):
+        yield rsp
+
+
+async def _update_node(client, node, element, inputdata):
+    if element == ['power', 'state']:
+        newstate, oldstate = await client.set_vm_power(node, inputdata.powerstate(node))
+        yield msg.PowerState(node, newstate, oldstate)
+    elif element == ['boot', 'nextdevice']:
+        applied_persistent = await client.set_vm_bootdev(
+            node, inputdata.bootdevice(node), persistent=inputdata.persistent(node),
+            bootmode=inputdata.bootmode(node))
+        nextdev, bootmode, _ = await client.get_vm_bootdev(node)
+        # Persistent if one-time was requested without the hookscript.
+        yield msg.BootDevice(node, nextdev, bootmode=bootmode, persistent=applied_persistent)
+    elif element == ['identify']:
+        state = inputdata.inputbynode[node]
+        await client.set_vm_identify(node, state)
+        yield msg.IdentifyState(node, state)
+    elif element == ['_enclosure', 'reseat_bay']:
+        await client.reseat_vm(node)
+        yield msg.ReseatResult(node, 'success')
+    elif element == ['media', 'attach']:
+        await client.attach_media(node, inputdata.nodefile(node))
+    elif element == ['media', 'detach']:
+        await client.detach_media(node)
+    elif element[:2] == ['configuration', 'system'] and element[2:] in (['all'], ['advanced']):
+        await client.set_vm_settings(node, inputdata.get_attributes(node))
+    elif element == ['configuration', 'system', 'clear']:
+        yield msg.ConfluentNodeError(node, 'A Proxmox VM has no firmware defaults to restore; set the '
+                                           'settings to an empty value to return them to the PVE default')
+    elif element[:2] == ['configuration', 'management_controller']:
+        yield msg.ConfluentNodeError(node, 'A Proxmox VM has no management controller to configure; it is '
+                                           'managed through Proxmox server {}'.format(client.server))
+    else:
+        yield _unsupported(node, element)
+
 
 async def update(nodes, element, configmanager, inputdata):
-    clientsbynode = await prep_proxmox_clients(nodes, configmanager)
-    for node in nodes:
-        currclient = clientsbynode[node]
-        if isinstance(currclient, Exception):
-            yield msg.ConfluentNodeError(node, str(currclient))
-            continue
-        try:
-            await currclient.get_vm(node)
-        except Exception as e:
-            yield msg.ConfluentNodeError(node, str(e))
-            continue
-        if element == ['power', 'state']:
-            # One failing guest must not abort the rest.
-            try:
-                newstate, oldstate = await currclient.set_vm_power(node, inputdata.powerstate(node))
-            except exc.ConfluentException as e:
-                yield msg.ConfluentNodeError(node, str(e))
-                continue
-            yield  msg.PowerState(node, newstate, oldstate)
-        elif element == ['boot', 'nextdevice']:
-            try:
-                applied_persistent = await currclient.set_vm_bootdev(
-                    node, inputdata.bootdevice(node), persistent=inputdata.persistent(node),
-                    bootmode=inputdata.bootmode(node))
-            except exc.ConfluentException as e:
-                yield msg.ConfluentNodeError(node, str(e))
-                continue
-            nextdev, bootmode, _ = await currclient.get_vm_bootdev(node)
-            # Persistent if one-time was requested without the hookscript.
-            yield msg.BootDevice(node, nextdev, bootmode=bootmode, persistent=applied_persistent)
-        elif element == ['console', 'ikvm']:
+    if element == ['console', 'ikvm']:
+        clientsbynode = await prep_proxmox_clients(nodes, configmanager)
+        for node in nodes:
             currclient = clientsbynode[node]
+            if isinstance(currclient, Exception):
+                yield msg.ConfluentNodeError(node, str(currclient))
+                continue
             if currclient.token:
                 # vinz forwards a cookie; a token needs a header.
                 yield msg.ConfluentNodeError(node, 'VNC needs a Proxmox user with a password; '
@@ -760,8 +1506,12 @@ async def update(nodes, element, configmanager, inputdata):
                 return
             yield msg.ChildCollection(url)
             return
+        return
+    async for rsp in _per_node(nodes, element, configmanager,
+                               lambda client, node: _update_node(client, node, element, inputdata)):
+        yield rsp
 
-# assume this is only console for now
+
 async def create(nodes, element, configmanager, inputdata):
     clientsbynode = await prep_proxmox_clients(nodes, configmanager)
     for node in nodes:
@@ -772,6 +1522,20 @@ async def create(nodes, element, configmanager, inputdata):
             await clientsbynode[node].get_vm(node)
         except Exception as e:
             yield msg.ConfluentNodeError(node, str(e))
+            continue
+        if element == ['media', 'uploads']:
+            upload = firmwaremanager.Updater(
+                node, functools.partial(clientsbynode[node].upload_media, node),
+                inputdata.nodefile(node), configmanager.tenant, type='mediaupload',
+                configmanager=configmanager)
+            yield msg.CreatedResource('nodes/{0}/media/uploads/{1}'.format(node, upload.name))
+            continue
+        if element == ['support', 'servicedata']:
+            download = firmwaremanager.Updater(
+                node, functools.partial(clientsbynode[node].collect_servicedata, node),
+                inputdata.nodefile(node), configmanager.tenant, type='ffdc',
+                owner=getattr(configmanager, 'current_user', None))
+            yield msg.CreatedResource('nodes/{0}/support/servicedata/{1}'.format(node, download.name))
             continue
         if element == ['console', 'ikvm']:
             currclient = clientsbynode[node]
@@ -787,9 +1551,26 @@ async def create(nodes, element, configmanager, inputdata):
                 return
             yield msg.ChildCollection(url)
             return
+        if element[:1] not in (['_console'], ['console']):
+            yield _unsupported(node, element)
+            continue
         serialdata = await clientsbynode[node].get_vm_serial(node)
         yield PmxConsole(serialdata, node, configmanager, clientsbynode[node])
         return
+
+
+async def delete(nodes, element, configmanager, inputdata):
+    for prefix, kind in _TRANSFERS:
+        if '/'.join(element).startswith(prefix):
+            for ret in firmwaremanager.remove_updates(nodes, configmanager.tenant, element, type=kind):
+                yield ret
+            return
+    for node in nodes:
+        if element == ['events', 'hardware', 'log']:
+            yield msg.ConfluentNodeError(node, 'The event log of a Proxmox VM is its PVE task history, '
+                                               'which cannot be cleared from confluent')
+        else:
+            yield _unsupported(node, element)
 
 
 async def _selftest():
