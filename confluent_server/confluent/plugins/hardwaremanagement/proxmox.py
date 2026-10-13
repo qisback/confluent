@@ -527,7 +527,6 @@ class PmxApiClient:
                 })
         yield msg.KeyValueData({'inventory': invitems}, vm)
 
-
     async def get_vm_ikvm(self, vm):
         return await self.get_vm_consproxy(vm, 'vnc')
 
@@ -625,8 +624,8 @@ class PmxApiClient:
                 task = await self.api('GET', '/api2/json/nodes/{}/tasks/{}/status'.format(
                     host, urlparse.quote(upid, safe='')))
                 if task.get('status') == 'stopped' and task.get('exitstatus') != 'OK':
-                    raise TaskFailed('{}: PVE task {} failed: {}'.format(
-                        vm, upid.split(':')[5] if upid.count(':') > 5 else 'action', task.get('exitstatus')))
+                    raise TaskFailed('PVE task {} failed: {}'.format(
+                        upid.split(':')[5] if upid.count(':') > 5 else 'action', task.get('exitstatus')))
             if loop.time() >= deadline:
                 raise exc.TargetResourceUnavailable(
                     '{} did not reach power state {} within {} seconds'.format(vm, target, timeout))
@@ -708,7 +707,13 @@ async def prep_proxmox_clients(nodes, configmanager):
         clientsbynode[node] = clientsbypmx[currpmx]
     return clientsbynode
 
-async def retrieve(nodes, element, configmanager, inputdata):
+
+def _unsupported(node, element):
+    return msg.ConfluentNodeError(node, '{} is not supported for Proxmox VMs'.format('/'.join(element)))
+
+
+async def _per_node(nodes, element, configmanager, handler):
+    """Run handler(client, node) per node; errors are reported per node."""
     clientsbynode = await prep_proxmox_clients(nodes, configmanager)
     for node in nodes:
         currclient = clientsbynode[node]
@@ -720,57 +725,63 @@ async def retrieve(nodes, element, configmanager, inputdata):
         except Exception as e:
             yield msg.ConfluentNodeError(node, str(e))
             continue
-        if element == ['power', 'state']:
-            yield msg.PowerState(node, await currclient.get_vm_power(node))
-        elif element == ['boot', 'nextdevice']:
-            nextdev, bootmode, persistent = await currclient.get_vm_bootdev(node)
-            yield msg.BootDevice(node, nextdev, bootmode=bootmode, persistent=persistent)
-        elif element[:2] == ['inventory', 'hardware'] and len(element) == 4:
-            async for rsp in currclient.get_vm_inventory(node):
+        try:
+            async for rsp in handler(currclient, node):
                 yield rsp
-        elif element == ['console', 'ikvm_methods']:
-            dsc = {'ikvm_methods': ['vnc']}
-            yield msg.KeyValueData(dsc, node)
-        elif element == ['console', 'ikvm_screenshot']:
-            # good background for the webui, and kitty
-            yield msg.ConfluentNodeError(node, "vnc available, screenshot not available")
-        elif element == ['health', 'hardware']:
-            yield msg.HealthSummary('unknown', node)
-            yield msg.SensorReadings([], node)
+        except (exc.ConfluentException, TaskFailed) as e:
+            yield msg.ConfluentNodeError(node, str(e))
+
+
+async def _retrieve_node(client, node, element):
+    if element == ['power', 'state']:
+        yield msg.PowerState(node, await client.get_vm_power(node))
+    elif element == ['boot', 'nextdevice']:
+        nextdev, bootmode, persistent = await client.get_vm_bootdev(node)
+        yield msg.BootDevice(node, nextdev, bootmode=bootmode, persistent=persistent)
+    elif element[:2] == ['inventory', 'hardware'] and len(element) == 4:
+        async for rsp in client.get_vm_inventory(node):
+            yield rsp
+    elif element == ['health', 'hardware']:
+        yield msg.HealthSummary('unknown', node)
+        yield msg.SensorReadings([], node)
+    elif element == ['console', 'ikvm_methods']:
+        yield msg.KeyValueData({'ikvm_methods': ['vnc']}, node)
+    elif element == ['console', 'ikvm_screenshot']:
+        # good background for the webui, and kitty
+        yield msg.ConfluentNodeError(node, "vnc available, screenshot not available")
+    else:
+        yield _unsupported(node, element)
+
+
+async def retrieve(nodes, element, configmanager, inputdata):
+    async for rsp in _per_node(nodes, element, configmanager,
+                               lambda client, node: _retrieve_node(client, node, element)):
+        yield rsp
+
+
+async def _update_node(client, node, element, inputdata):
+    if element == ['power', 'state']:
+        newstate, oldstate = await client.set_vm_power(node, inputdata.powerstate(node))
+        yield msg.PowerState(node, newstate, oldstate)
+    elif element == ['boot', 'nextdevice']:
+        applied_persistent = await client.set_vm_bootdev(
+            node, inputdata.bootdevice(node), persistent=inputdata.persistent(node),
+            bootmode=inputdata.bootmode(node))
+        nextdev, bootmode, _ = await client.get_vm_bootdev(node)
+        # Persistent if one-time was requested without the hookscript.
+        yield msg.BootDevice(node, nextdev, bootmode=bootmode, persistent=applied_persistent)
+    else:
+        yield _unsupported(node, element)
+
 
 async def update(nodes, element, configmanager, inputdata):
-    clientsbynode = await prep_proxmox_clients(nodes, configmanager)
-    for node in nodes:
-        currclient = clientsbynode[node]
-        if isinstance(currclient, Exception):
-            yield msg.ConfluentNodeError(node, str(currclient))
-            continue
-        try:
-            await currclient.get_vm(node)
-        except Exception as e:
-            yield msg.ConfluentNodeError(node, str(e))
-            continue
-        if element == ['power', 'state']:
-            # One failing guest must not abort the rest.
-            try:
-                newstate, oldstate = await currclient.set_vm_power(node, inputdata.powerstate(node))
-            except exc.ConfluentException as e:
-                yield msg.ConfluentNodeError(node, str(e))
-                continue
-            yield  msg.PowerState(node, newstate, oldstate)
-        elif element == ['boot', 'nextdevice']:
-            try:
-                applied_persistent = await currclient.set_vm_bootdev(
-                    node, inputdata.bootdevice(node), persistent=inputdata.persistent(node),
-                    bootmode=inputdata.bootmode(node))
-            except exc.ConfluentException as e:
-                yield msg.ConfluentNodeError(node, str(e))
-                continue
-            nextdev, bootmode, _ = await currclient.get_vm_bootdev(node)
-            # Persistent if one-time was requested without the hookscript.
-            yield msg.BootDevice(node, nextdev, bootmode=bootmode, persistent=applied_persistent)
-        elif element == ['console', 'ikvm']:
+    if element == ['console', 'ikvm']:
+        clientsbynode = await prep_proxmox_clients(nodes, configmanager)
+        for node in nodes:
             currclient = clientsbynode[node]
+            if isinstance(currclient, Exception):
+                yield msg.ConfluentNodeError(node, str(currclient))
+                continue
             if currclient.token:
                 # vinz forwards a cookie; a token needs a header.
                 yield msg.ConfluentNodeError(node, 'VNC needs a Proxmox user with a password; '
@@ -783,8 +794,12 @@ async def update(nodes, element, configmanager, inputdata):
                 return
             yield msg.ChildCollection(url)
             return
+        return
+    async for rsp in _per_node(nodes, element, configmanager,
+                               lambda client, node: _update_node(client, node, element, inputdata)):
+        yield rsp
 
-# assume this is only console for now
+
 async def create(nodes, element, configmanager, inputdata):
     clientsbynode = await prep_proxmox_clients(nodes, configmanager)
     for node in nodes:
@@ -810,6 +825,9 @@ async def create(nodes, element, configmanager, inputdata):
                 return
             yield msg.ChildCollection(url)
             return
+        if element[:1] not in (['_console'], ['console']):
+            yield _unsupported(node, element)
+            continue
         serialdata = await clientsbynode[node].get_vm_serial(node)
         yield PmxConsole(serialdata, node, configmanager, clientsbynode[node])
         return
