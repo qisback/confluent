@@ -527,6 +527,26 @@ class PmxApiClient:
                 })
         yield msg.KeyValueData({'inventory': invitems}, vm)
 
+    async def get_vm_status(self, vm):
+        return await self.api('GET', 'status/current', vm=vm)
+
+    async def wait_task(self, host, upid, timeout):
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + timeout
+        while True:
+            task = await self.api('GET', '/api2/json/nodes/{}/tasks/{}/status'.format(
+                host, urlparse.quote(upid, safe='')))
+            if task.get('status') == 'stopped':
+                exitstatus = task.get('exitstatus') or ''
+                if exitstatus != 'OK' and not exitstatus.startswith('WARNINGS'):
+                    raise TaskFailed('PVE task {} failed: {}'.format(
+                        upid.split(':')[5] if upid.count(':') > 5 else upid, exitstatus))
+                return
+            if loop.time() >= deadline:
+                raise exc.TargetResourceUnavailable('PVE task {} still running after {} seconds'.format(
+                    upid, timeout))
+            await asyncio.sleep(1)
+
     async def get_vm_ikvm(self, vm):
         return await self.get_vm_consproxy(vm, 'vnc')
 
@@ -569,15 +589,51 @@ class PmxApiClient:
         raise exc.TargetResourceUnavailable(
             'Unknown power status {!r} (qmpstatus {!r}) for {}'.format(currstatus, rsp.get('qmpstatus'), vm))
 
+    async def get_vm_powerstate(self, vm):
+        """on, off, paused, suspended (to RAM) or hibernated (to disk)."""
+        rsp = await self.get_vm_status(vm)
+        if rsp.get('status') == 'running':
+            return {'paused': 'paused', 'suspended': 'suspended'}.get(rsp.get('qmpstatus'), 'on')
+        if rsp.get('status') == 'stopped':
+            return 'hibernated' if rsp.get('lock') == 'suspended' else 'off'
+        return await self.get_vm_power(vm)
+
+    async def inject_nmi(self, vm):
+        if await self.get_vm_power(vm) != 'on':
+            raise exc.InvalidArgumentException('{} is not running; an NMI needs a running VM'.format(vm))
+        try:
+            await self.api('POST', 'monitor', {'command': 'nmi'}, vm=vm)
+        except exc.TargetResourceUnavailable as e:
+            # 'nmi' is root@pam only (PVE 9); other non-info commands need Sys.Modify on /.
+            if 'HTTP 403' in str(e) or 'root-only' in str(e):
+                raise exc.TargetResourceUnavailable(
+                    'diag sends an NMI through the QEMU monitor, which Proxmox allows for root@pam '
+                    'only: {}'.format(e))
+            raise
+
     # Seconds per action; shutdown waits on the guest's ACPI handling.
     power_timeout = {'start': 60, 'stop': 60, 'shutdown': 300}
 
     async def set_vm_power(self, vm, state):
         current = None
         if state == 'diag':
-            raise exc.InvalidArgumentException('Proxmox VMs have no diagnostic interrupt')
+            await self.inject_nmi(vm)
+            return 'diag', None
         if state not in ('on', 'off', 'shutdown', 'boot', 'reset'):
             raise exc.InvalidArgumentException('Unsupported power state {}'.format(state))
+        if state == 'on':
+            current = await self.get_vm_powerstate(vm)
+            if current in ('paused', 'suspended'):
+                # PVE refuses start on a paused/suspended VM.
+                host, _ = await self.get_vm(vm)
+                upid = await self.api('POST', 'status/resume', vm=vm)
+                try:
+                    await self.wait_task(host, upid, self.power_timeout['start'])
+                except TaskFailed as e:
+                    raise exc.TargetResourceUnavailable(str(e))
+                return 'on', current
+            # Hibernated: start resumes from disk.
+            current = None
         if state == 'boot':
             current = await self.get_vm_power(vm)
             action = 'reset' if current == 'on' else 'start'
@@ -734,7 +790,7 @@ async def _per_node(nodes, element, configmanager, handler):
 
 async def _retrieve_node(client, node, element):
     if element == ['power', 'state']:
-        yield msg.PowerState(node, await client.get_vm_power(node))
+        yield msg.PowerState(node, await client.get_vm_powerstate(node))
     elif element == ['boot', 'nextdevice']:
         nextdev, bootmode, persistent = await client.get_vm_bootdev(node)
         yield msg.BootDevice(node, nextdev, bootmode=bootmode, persistent=persistent)
