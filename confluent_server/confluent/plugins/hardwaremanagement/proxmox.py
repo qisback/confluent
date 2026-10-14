@@ -260,6 +260,57 @@ def vm_inventory(cfg, host, vmid, guest=None):
     return items
 
 
+# nodeconfig name -> (PVE key, PVE default, possible values, help).
+_OSTYPES = ['other', 'wxp', 'w2k', 'w2k3', 'w2k8', 'wvista', 'win7', 'win8', 'win10', 'win11',
+            'l24', 'l26', 'solaris']
+SYSTEMSETTINGS = {
+    'cores': ('cores', '1', None, 'CPU cores per socket'),
+    'sockets': ('sockets', '1', None, 'CPU sockets'),
+    'vcpus': ('vcpus', '', None, 'vCPUs plugged at start (empty: sockets x cores)'),
+    'cpu': ('cpu', 'kvm64', None, 'Emulated CPU type, with optional flags'),
+    'memory': ('memory', '512', None, 'Memory in MiB'),
+    'balloon': ('balloon', '', None, 'Balloon target minimum in MiB; 0 disables the balloon device'),
+    'numa': ('numa', '0', ['0', '1'], 'NUMA topology'),
+    'bios': ('bios', 'seabios', ['seabios', 'ovmf'],
+             'Firmware. Changing it under an installed OS usually leaves it unbootable'),
+    'machine': ('machine', '', None, 'QEMU machine type (empty: newest i440fx)'),
+    'ostype': ('ostype', 'other', _OSTYPES, 'Guest OS type, for PVE-side optimisations'),
+    'onboot': ('onboot', '0', ['0', '1'], 'Start with the Proxmox node'),
+    'agent': ('agent', '0', None, 'QEMU guest agent (1, or 1,fstrim_cloned_disks=1, ...)'),
+    'tablet': ('tablet', '1', ['0', '1'], 'USB tablet for absolute pointer'),
+    'protection': ('protection', '0', ['0', '1'], 'Refuse removal of the VM and its disks'),
+}
+TPMVERSIONS = ['none', 'v1.2', 'v2.0']
+
+
+def system_settings(nextcfg, curcfg):
+    """value: as of the next start; active: now."""
+    settings = {}
+    for name, (key, default, possible, helptext) in SYSTEMSETTINGS.items():
+        setting = {'value': str(nextcfg.get(key, default)), 'active': str(curcfg.get(key, default)),
+                   'default': default, 'help': helptext}
+        if possible:
+            setting['possible'] = possible
+        settings[name] = setting
+    tpm = [drive_options(cfg.get('tpmstate0'))[1].get('version', 'v1.2') if cfg.get('tpmstate0') else 'none'
+           for cfg in (nextcfg, curcfg)]
+    settings['tpm'] = {'value': tpm[0], 'active': tpm[1], 'default': 'none', 'possible': TPMVERSIONS,
+                       'help': 'TPM state device. Removing it destroys the keys it holds'}
+    secure = []
+    for cfg in (nextcfg, curcfg):
+        if cfg.get('bios') != 'ovmf':
+            secure.append('n/a')
+        elif drive_options(cfg.get('efidisk0'))[1].get('pre-enrolled-keys') == '1':
+            secure.append('enabled')
+        else:
+            secure.append('disabled')
+    settings['secure_boot'] = {
+        'value': secure[0], 'active': secure[1], 'default': 'n/a',
+        'help': 'UEFI Secure Boot (EFI disk with pre-enrolled keys). Read only: changing it means '
+                'recreating the EFI disk'}
+    return settings
+
+
 class TaskFailed(Exception):
     """A PVE task ended with an error."""
 
@@ -649,6 +700,10 @@ class PmxApiClient:
             {'Proxmox VE': {'version': (version or {}).get('version')}},
         ]
 
+    async def get_vm_location(self, vm):
+        host, guest = await self.get_vm(vm)
+        return {'manager': self.server, 'pve_node': host, 'vmid': guest.split('/')[-1]}
+
     async def wait_task(self, host, upid, timeout):
         loop = asyncio.get_running_loop()
         deadline = loop.time() + timeout
@@ -665,6 +720,60 @@ class PmxApiClient:
                 raise exc.TargetResourceUnavailable('PVE task {} still running after {} seconds'.format(
                     upid, timeout))
             await asyncio.sleep(1)
+
+    # nodeconfig: VM settings.
+
+    async def get_vm_settings(self, vm):
+        nextcfg = next_config(await self.api('GET', 'pending', vm=vm))
+        curcfg = await self.api('GET', 'config', vm=vm)
+        return system_settings(nextcfg, curcfg)
+
+    async def set_vm_settings(self, vm, changes):
+        update = {}
+        delete = []
+        for name, value in changes.items():
+            value = '' if value is None else str(value)
+            if name == 'tpm':
+                await self.set_vm_tpm(vm, value)
+                continue
+            if name == 'secure_boot':
+                raise exc.InvalidArgumentException(
+                    'secure_boot is read only: it is set by the keys enrolled on the EFI disk')
+            if name not in SYSTEMSETTINGS:
+                raise exc.InvalidArgumentException('{} is not a Proxmox VM setting; settable: {}'.format(
+                    name, ', '.join(sorted(list(SYSTEMSETTINGS) + ['tpm']))))
+            key, _, possible, _ = SYSTEMSETTINGS[name]
+            if value == '':
+                delete.append(key)
+            elif possible and value not in possible:
+                raise exc.InvalidArgumentException('{} must be one of {}'.format(name, ', '.join(possible)))
+            else:
+                update[key] = value
+        if delete:
+            update['delete'] = ','.join(delete)
+        if update:
+            await self.api('PUT', 'config', update, vm=vm)
+
+    async def set_vm_tpm(self, vm, version):
+        if version not in TPMVERSIONS:
+            raise exc.InvalidArgumentException('tpm must be one of {}'.format(', '.join(TPMVERSIONS)))
+        cfg = next_config(await self.api('GET', 'pending', vm=vm))
+        current = drive_options(cfg['tpmstate0'])[1].get('version', 'v1.2') if cfg.get('tpmstate0') else 'none'
+        if version == current:
+            return
+        if version == 'none':
+            await self.api('PUT', 'config', {'delete': 'tpmstate0'}, vm=vm)
+            return
+        if current != 'none':
+            raise exc.InvalidArgumentException(
+                '{} already has a {} TPM; set tpm=none first (this destroys its keys)'.format(vm, current))
+        # TPM state on the EFI disk's storage, else the first disk's.
+        source = cfg.get('efidisk0') or next((cfg[k] for k in disk_drives(cfg)), None)
+        if not source or ':' not in source:
+            raise exc.InvalidArgumentException('{} has no disk storage to put a TPM state on'.format(vm))
+        storage = drive_options(source)[0].split(':', 1)[0]
+        await self.api('PUT', 'config', {'tpmstate0': '{}:1,version={}'.format(storage, version)}, vm=vm)
+
 
     async def get_vm_ikvm(self, vm):
         return await self.get_vm_consproxy(vm, 'vnc')
@@ -943,6 +1052,23 @@ async def _retrieve_node(client, node, element):
     elif element == ['health', 'hardware']:
         yield msg.HealthSummary('unknown', node)
         yield msg.SensorReadings([], node)
+    elif element[:2] == ['configuration', 'system'] and element[2:] in (['all'], ['advanced']):
+        yield msg.ConfigSet(node, await client.get_vm_settings(node))
+    elif element[:3] == ['configuration', 'management_controller', 'extended']:
+        # Manager, current PVE node and VMID.
+        settings = {}
+        if element[3:] == ['all']:
+            settings = dict((key, {'value': val}) for key, val in (await client.get_vm_location(node)).items())
+        yield msg.ConfigSet(node, settings)
+    elif element == ['configuration', 'management_controller', 'location']:
+        yield msg.KeyValueData(await client.get_vm_location(node), node)
+    elif element == ['configuration', 'management_controller', 'net_interfaces']:
+        yield msg.ChildCollection('management')
+    elif element == ['configuration', 'management_controller', 'net_interfaces', 'management']:
+        # No management controller.
+        yield msg.NetworkConfiguration(name=node)
+    elif element == ['configuration', 'management_controller', 'hostname']:
+        yield msg.Hostname(node, None)
     elif element[:2] == ['configuration', 'storage'] and len(element) >= 3:
         if element[2] not in ('all', 'disks'):
             return
@@ -984,6 +1110,14 @@ async def _update_node(client, node, element, inputdata):
         nextdev, bootmode, _ = await client.get_vm_bootdev(node)
         # Persistent if one-time was requested without the hookscript.
         yield msg.BootDevice(node, nextdev, bootmode=bootmode, persistent=applied_persistent)
+    elif element[:2] == ['configuration', 'system'] and element[2:] in (['all'], ['advanced']):
+        await client.set_vm_settings(node, inputdata.get_attributes(node))
+    elif element == ['configuration', 'system', 'clear']:
+        yield msg.ConfluentNodeError(node, 'A Proxmox VM has no firmware defaults to restore; set the '
+                                           'settings to an empty value to return them to the PVE default')
+    elif element[:2] == ['configuration', 'management_controller']:
+        yield msg.ConfluentNodeError(node, 'A Proxmox VM has no management controller to configure; it is '
+                                           'managed through Proxmox server {}'.format(client.server))
     else:
         yield _unsupported(node, element)
 
