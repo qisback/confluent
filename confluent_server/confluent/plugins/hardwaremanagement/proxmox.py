@@ -157,6 +157,109 @@ def parse_nic(text):
     return model, mac
 
 
+_DRIVERE = re.compile(r'({})\d+$'.format('|'.join(_DRIVEBUSES)))
+
+
+def drive_options(text):
+    """(volume, {option: value}) from a drive value: 'local:iso/x.iso,media=cdrom'."""
+    volume, _, rest = (text or '').partition(',')
+    if volume.startswith('file='):
+        volume = volume[len('file='):]
+    opts = {}
+    for item in rest.split(','):
+        key, sep, val = item.partition('=')
+        if sep:
+            opts[key] = val
+    return volume, opts
+
+
+def cdrom_drives(cfg):
+    return sorted((k for k in cfg if _DRIVERE.match(k) and 'media=cdrom' in (cfg[k] or '')), key=_devkey)
+
+
+def disk_drives(cfg):
+    return sorted((k for k in cfg if _DRIVERE.match(k) and 'media=cdrom' not in (cfg[k] or '')), key=_devkey)
+
+
+def memory_mib(cfg):
+    # Plain MiB, or 'current=N,...' (PVE 8.1+).
+    text = str(cfg.get('memory', '512'))
+    if '=' in text:
+        text = dict(item.partition('=')[::2] for item in text.split(',')).get('current', '512')
+    return int(text)
+
+
+def simplify(name):
+    """Component name as used in confluent paths."""
+    return name.lower().replace(' ', '_')
+
+
+def agent_enabled(cfg):
+    # '1', '1,fstrim_cloned_disks=1' or 'enabled=1,...'.
+    first = str(cfg.get('agent', '0')).split(',')[0]
+    return first.partition('=')[2] == '1' if '=' in first else first == '1'
+
+
+def vm_inventory(cfg, host, vmid, guest=None):
+    """nodeinventory items from the config; guest: agent {'os', 'interfaces'} or {'error'}."""
+    smbios = parse_smbios1(cfg.get('smbios1', ''))
+    info = {
+        'Product name': 'Proxmox qemu virtual machine',
+        'Manufacturer': 'qemu',
+    }
+    for field, label in _SMBIOSFIELDS:
+        if smbios.get(field):
+            info[label] = smbios[field]
+    info['Model'] = info['Product name']
+    info['Proxmox node'] = host
+    info['VM ID'] = vmid
+    items = [{'name': 'System', 'present': True, 'information': info}]
+    cputype = (cfg.get('cpu') or 'kvm64').split(',')[0]
+    if cputype.startswith('cputype='):
+        cputype = cputype[len('cputype='):]
+    sockets, cores = int(cfg.get('sockets', 1)), int(cfg.get('cores', 1))
+    items.append({'name': 'CPU', 'present': True, 'information': {
+        'Model': cputype, 'Sockets': sockets, 'Cores per socket': cores,
+        'vCPUs': int(cfg.get('vcpus') or sockets * cores)}})
+    items.append({'name': 'Memory', 'present': True, 'information': {
+        'Size (MiB)': memory_mib(cfg), 'Balloon minimum (MiB)': cfg.get('balloon')}})
+    guest = guest or {}
+    addrsbymac = {}
+    for iface in guest.get('interfaces') or []:
+        mac = (iface.get('hardware-address') or '').lower()
+        addrs = ['{}/{}'.format(a['ip-address'], a.get('prefix')) for a in iface.get('ip-addresses') or []
+                 if a.get('ip-address') and not a['ip-address'].startswith(('127.', '::1', 'fe80:'))]
+        if mac and addrs:
+            addrsbymac.setdefault(mac, []).extend(addrs)
+    for key in sorted((k for k in cfg if re.match(r'net\d+$', k)), key=_devkey):
+        model, mac = parse_nic(cfg[key])
+        info = {'Type': 'Ethernet', 'Model': model, 'MAC Address 1': mac}
+        if addrsbymac.get((mac or '').lower()):
+            info['IP Addresses'] = ', '.join(addrsbymac[mac.lower()])
+        items.append({'name': 'Network adapter {}'.format(key), 'present': True, 'information': info})
+    if guest.get('os'):
+        osinfo = guest['os']
+        items.append({'name': 'Guest OS', 'present': True, 'information': {
+            'Name': osinfo.get('pretty-name') or osinfo.get('name'), 'Version': osinfo.get('version'),
+            'Kernel': osinfo.get('kernel-release'), 'Architecture': osinfo.get('machine')}})
+    elif guest.get('error'):
+        items.append({'name': 'Guest OS', 'present': False, 'information': {
+            'Status': 'QEMU guest agent: {}'.format(guest['error'])}})
+    for key in disk_drives(cfg):
+        volume, opts = drive_options(cfg[key])
+        items.append({'name': 'Disk {}'.format(key), 'present': True, 'information': {
+            'Type': 'Disk', 'Volume': volume, 'Size': opts.get('size'), 'Serial Number': opts.get('serial')}})
+    for key in cdrom_drives(cfg):
+        volume, _ = drive_options(cfg[key])
+        items.append({'name': 'CD-ROM {}'.format(key), 'present': True, 'information': {
+            'Type': 'CD-ROM', 'Media': None if volume == 'none' else volume}})
+    if cfg.get('tpmstate0'):
+        volume, opts = drive_options(cfg['tpmstate0'])
+        items.append({'name': 'TPM', 'present': True, 'information': {
+            'Version': opts.get('version', 'v1.2'), 'Volume': volume}})
+    return items
+
+
 class TaskFailed(Exception):
     """A PVE task ended with an error."""
 
@@ -502,33 +605,49 @@ class PmxApiClient:
         return self.vmmap[vm]
 
 
-    async def get_vm_inventory(self, vm):
+    async def get_vm_inventory(self, vm, component='all'):
         # Current config: pending NICs are not present yet.
         cfg = await self.api('GET', 'config', vm=vm)
-        info = {
-            'Product name': 'Proxmox qemu virtual machine',
-            'Manufacturer': 'qemu',
-            }
-        smbios = parse_smbios1(cfg.get('smbios1', ''))
-        for field, label in _SMBIOSFIELDS:
-            if smbios.get(field):
-                info[label] = smbios[field]
-        invitems = [{'name': 'System', 'present': True, 'information': info}]
-        for key in sorted((k for k in cfg if re.match(r'net\d+$', k)), key=_devkey):
-            model, mac = parse_nic(cfg[key])
-            invitems.append({
-                'present': True,
-                'name': 'Network adapter {}'.format(key),
-                'information': {
-                    'Type': 'Ethernet',
-                    'Model': model,
-                    'MAC Address 1': mac,
-                    }
-                })
+        host, guest = await self.get_vm(vm)
+        guestinfo = None
+        if component in ('all', 'guest_os') or component.startswith('network'):
+            guestinfo = await self.get_guest_info(vm, cfg)
+        invitems = vm_inventory(cfg, host, guest.split('/')[-1], guestinfo)
+        if component != 'all':
+            invitems = [item for item in invitems if component in (item['name'], simplify(item['name']))]
         yield msg.KeyValueData({'inventory': invitems}, vm)
+
+    async def get_guest_info(self, vm, cfg):
+        """Guest agent OS and interfaces; None if no agent or VM off, {'error'} if it fails.
+
+        Needs VM.GuestAgent.Audit (PVE 9) or VM.Monitor (PVE 8).
+        """
+        if not agent_enabled(cfg) or await self.get_vm_power(vm) != 'on':
+            return None
+        info = {}
+        try:
+            info['os'] = ((await self.api('GET', 'agent/get-osinfo', vm=vm)) or {}).get('result')
+            info['interfaces'] = ((await self.api('GET', 'agent/network-get-interfaces', vm=vm)) or {}).get('result')
+        except exc.TargetResourceUnavailable as e:
+            # e.g. 'HTTP 500: QEMU guest agent is not running'.
+            return {'error': 'HTTP ' + str(e).split(': HTTP ', 1)[-1]}
+        return info
 
     async def get_vm_status(self, vm):
         return await self.api('GET', 'status/current', vm=vm)
+
+    async def get_vm_firmware(self, vm):
+        cfg = await self.api('GET', 'config', vm=vm)
+        status = await self.get_vm_status(vm)
+        version = await self.api('GET', '/api2/json/version')
+        running = status.get('status') == 'running'
+        return [
+            {'BIOS': {'version': 'OVMF (UEFI)' if cfg.get('bios') == 'ovmf' else 'SeaBIOS'}},
+            {'QEMU': {'version': status.get('running-qemu') if running else None}},
+            {'Machine type': {'version': (status.get('running-machine') if running else None)
+                              or cfg.get('machine') or 'pc (newest i440fx)'}},
+            {'Proxmox VE': {'version': (version or {}).get('version')}},
+        ]
 
     async def wait_task(self, host, upid, timeout):
         loop = asyncio.get_running_loop()
@@ -788,18 +907,57 @@ async def _per_node(nodes, element, configmanager, handler):
             yield msg.ConfluentNodeError(node, str(e))
 
 
+async def _inventory_items(client, node):
+    cfg = await client.api('GET', 'config', vm=node)
+    host, guest = await client.get_vm(node)
+    return vm_inventory(cfg, host, guest.split('/')[-1], await client.get_guest_info(node, cfg))
+
+
 async def _retrieve_node(client, node, element):
     if element == ['power', 'state']:
         yield msg.PowerState(node, await client.get_vm_powerstate(node))
     elif element == ['boot', 'nextdevice']:
         nextdev, bootmode, persistent = await client.get_vm_bootdev(node)
         yield msg.BootDevice(node, nextdev, bootmode=bootmode, persistent=persistent)
+    elif element[:2] == ['inventory', 'hardware'] and len(element) == 3:
+        yield msg.ChildCollection('all')
+        for item in await _inventory_items(client, node):
+            yield msg.ChildCollection(simplify(item['name']))
     elif element[:2] == ['inventory', 'hardware'] and len(element) == 4:
-        async for rsp in client.get_vm_inventory(node):
+        async for rsp in client.get_vm_inventory(node, element[3]):
             yield rsp
+    elif element[:2] == ['inventory', 'firmware']:
+        if len(element) < 3 or element[2] not in ('all', 'core', 'adapters', 'disks', 'misc'):
+            yield _unsupported(node, element)
+            return
+        items = await client.get_vm_firmware(node) if element[2] in ('all', 'core') else []
+        if len(element) == 3:
+            yield msg.ChildCollection('all')
+            for item in items:
+                for name in item:
+                    yield msg.ChildCollection(simplify(name))
+            return
+        if element[3] != 'all':
+            items = [item for item in items if element[3] in [simplify(name) for name in item] + list(item)]
+        yield msg.Firmware(items, node)
     elif element == ['health', 'hardware']:
         yield msg.HealthSummary('unknown', node)
         yield msg.SensorReadings([], node)
+    elif element[:2] == ['configuration', 'storage'] and len(element) >= 3:
+        if element[2] not in ('all', 'disks'):
+            return
+        cfg = await client.api('GET', 'config', vm=node)
+        disks = disk_drives(cfg)
+        if element[2] == 'disks' and len(element) == 3:
+            for key in disks:
+                yield msg.ChildCollection(key)
+            return
+        if element[2] == 'disks':
+            disks = [key for key in disks if key == element[3]]
+        for key in disks:
+            volume, opts = drive_options(cfg[key])
+            yield msg.Disk(node, label=key, description='{} ({})'.format(volume, opts.get('size', 'size unknown')),
+                           diskid=key, state='online', serial=opts.get('serial'))
     elif element == ['console', 'ikvm_methods']:
         yield msg.KeyValueData({'ikvm_methods': ['vnc']}, node)
     elif element == ['console', 'ikvm_screenshot']:
