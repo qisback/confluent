@@ -61,8 +61,8 @@ def _devkey(dev):
 
 # confluent boot device -> device class moved to the front; None: disks first, network last.
 BOOTCLASS = {'network': 'net', 'net': 'net', 'hd': 'disk', 'cd': 'cdrom', 'usb': 'usb', 'default': None}
-# misc/proxmox/confluent-boot-oneshot.pl; makes a boot device one-time.
-ONESHOT_HOOK = 'confluent-boot-oneshot.pl'
+# misc/proxmox/confluent-boot-oneshot.py; makes a boot device one-time.
+ONESHOT_HOOK = 'confluent-boot-oneshot'
 ONESHOT_MARKER = re.compile(r'^confluent-boot-restore: .*(?:\n|$)', re.M)
 
 
