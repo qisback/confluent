@@ -200,6 +200,14 @@ def simplify(name):
     return name.lower().replace(' ', '_')
 
 
+def tag_list(cfg):
+    return [tag for tag in re.split(r'[;, ]+', cfg.get('tags') or '') if tag]
+
+
+# nodeidentify: no LED on a VM, so a tag shown in the PVE UI.
+IDENTIFY_TAG = 'confluent-identify'
+
+
 def agent_enabled(cfg):
     # '1', '1,fstrim_cloned_disks=1' or 'enabled=1,...'.
     first = str(cfg.get('agent', '0')).split(',')[0]
@@ -712,6 +720,27 @@ class PmxApiClient:
         host, guest = await self.get_vm(vm)
         return {'manager': self.server, 'pve_node': host, 'vmid': guest.split('/')[-1]}
 
+    async def get_vm_identify(self, vm):
+        cfg = await self.api('GET', 'config', vm=vm)
+        return 'on' if IDENTIFY_TAG in tag_list(cfg) else 'off'
+
+    async def set_vm_identify(self, vm, state):
+        if state not in ('on', 'off', 'blink'):
+            raise exc.InvalidArgumentException('Unsupported identify state {}'.format(state))
+        cfg = await self.api('GET', 'config', vm=vm)
+        tags = tag_list(cfg)
+        want = state != 'off'
+        if (IDENTIFY_TAG in tags) == want:
+            return
+        tags = [tag for tag in tags if tag != IDENTIFY_TAG] + ([IDENTIFY_TAG] if want else [])
+        await self.api('PUT', 'config', {'tags': ';'.join(tags)} if tags else {'delete': 'tags'}, vm=vm)
+
+    async def reseat_vm(self, vm):
+        # Hard off, then on; a cold start applies pending config.
+        if await self.get_vm_power(vm) == 'on':
+            await self.set_vm_power(vm, 'off')
+        await self.set_vm_power(vm, 'on')
+
     async def wait_task(self, host, upid, timeout):
         loop = asyncio.get_running_loop()
         deadline = loop.time() + timeout
@@ -1209,6 +1238,8 @@ async def _retrieve_node(client, node, element):
     elif element == ['health', 'hardware']:
         yield msg.HealthSummary('unknown', node)
         yield msg.SensorReadings([], node)
+    elif element == ['identify']:
+        yield msg.IdentifyState(node, await client.get_vm_identify(node))
     elif element == ['media', 'current']:
         for media in await client.get_vm_media(node):
             yield msg.Media(node, rawmedia=media)
@@ -1278,6 +1309,13 @@ async def _update_node(client, node, element, inputdata):
         nextdev, bootmode, _ = await client.get_vm_bootdev(node)
         # Persistent if one-time was requested without the hookscript.
         yield msg.BootDevice(node, nextdev, bootmode=bootmode, persistent=applied_persistent)
+    elif element == ['identify']:
+        state = inputdata.inputbynode[node]
+        await client.set_vm_identify(node, state)
+        yield msg.IdentifyState(node, state)
+    elif element == ['_enclosure', 'reseat_bay']:
+        await client.reseat_vm(node)
+        yield msg.ReseatResult(node, 'success')
     elif element == ['media', 'attach']:
         await client.attach_media(node, inputdata.nodefile(node))
     elif element == ['media', 'detach']:
