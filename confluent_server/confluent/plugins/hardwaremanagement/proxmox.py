@@ -544,6 +544,8 @@ class PmxApiClient:
         self.vmdupes = {}
         self.vmlist = {}
         self.vmbyid = {}
+        # node -> custom.pve.isostorage: where nodemedia puts ISO images.
+        self.isostorage = {}
         self.logged = False
 
     @property
@@ -740,9 +742,21 @@ class PmxApiClient:
             media.append({'name': name, 'url': location if sep else None, 'secure': True})
         return media
 
-    async def iso_storage(self, host):
-        """First active ISO storage on host."""
+    async def iso_storage(self, host, vm=None):
+        """The VM's custom.pve.isostorage, else the first active ISO storage on host."""
         stores = await self.api('GET', '/api2/json/nodes/{}/storage?content=iso&enabled=1'.format(host))
+        wanted = self.isostorage.get(vm)
+        if wanted:
+            for store in stores or []:
+                if store['storage'] == wanted:
+                    if not store.get('active', 1):
+                        raise exc.TargetResourceUnavailable(
+                            "ISO storage '{}' (custom.pve.isostorage) is not active on Proxmox node {}".format(
+                                wanted, host))
+                    return wanted
+            raise exc.InvalidArgumentException(
+                "ISO storage '{}' (custom.pve.isostorage) is not on Proxmox node {}, does not hold ISO images, "
+                "or is not visible to {} (Datastore.Audit)".format(wanted, host, self.user))
         for store in sorted(stores or [], key=lambda s: s['storage']):
             if store.get('active', 1):
                 return store['storage']
@@ -761,7 +775,7 @@ class PmxApiClient:
             url = url[len('pve://'):]
         if re.match(r'(https?|ftp)://', url):
             host, _ = await self.get_vm(vm)
-            storage = await self.iso_storage(host)
+            storage = await self.iso_storage(host, vm)
             name = urlparse.unquote(urlparse.urlsplit(url).path.rsplit('/', 1)[-1])
             if not re.match(r'[\w.+-]+\.(iso|img)$', name, re.I):
                 raise exc.InvalidArgumentException(
@@ -816,7 +830,7 @@ class PmxApiClient:
     async def upload_media(self, vm, filename, progress, data=None):
         """nodemedia upload: stream a local image to ISO storage, then insert it."""
         host, _ = await self.get_vm(vm)
-        storage = await self.iso_storage(host)
+        storage = await self.iso_storage(host, vm)
         if not self.logged:
             await self.login()
         name = os.path.basename(filename)
@@ -1112,7 +1126,7 @@ class PmxApiClient:
 
 
 async def prep_proxmox_clients(nodes, configmanager):
-    cfginfo = configmanager.get_node_attributes(nodes, ['hardwaremanagement.manager', 'secret.hardwaremanagementuser', 'secret.hardwaremanagementpassword'], decrypt=True)
+    cfginfo = configmanager.get_node_attributes(nodes, ['hardwaremanagement.manager', 'secret.hardwaremanagementuser', 'secret.hardwaremanagementpassword', 'custom.pve.isostorage'], decrypt=True)
     clientsbypmx = {}
     clientsbynode = {}
     for node in nodes:
@@ -1129,6 +1143,9 @@ async def prep_proxmox_clients(nodes, configmanager):
             except exc.TargetEndpointUnreachable as e:
                 clientsbypmx[currpmx] = e
         clientsbynode[node] = clientsbypmx[currpmx]
+        isostorage = cfg.get('custom.pve.isostorage', {}).get('value')
+        if isostorage and not isinstance(clientsbynode[node], Exception):
+            clientsbynode[node].isostorage[node] = isostorage
     return clientsbynode
 
 
