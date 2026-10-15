@@ -11,10 +11,14 @@ import aiohmi.util.webclient as webclient
 import aiohmi.exceptions as pygexc
 import confluent.interface.console as conapi
 import confluent.log as log
+import confluent.firmwaremanager as firmwaremanager
+import functools
 import random
 import io
 import json
+import os
 import re
+import secrets
 import urllib.parse as urlparse
 import aiohttp
 
@@ -158,6 +162,8 @@ def parse_nic(text):
 
 
 _DRIVERE = re.compile(r'({})\d+$'.format('|'.join(_DRIVEBUSES)))
+# Slots for a new CD-ROM, PVE's default first.
+_CDROMSLOTS = ['ide2', 'ide0', 'ide1', 'ide3'] + ['sata{}'.format(n) for n in range(6)]
 
 
 def drive_options(text):
@@ -721,6 +727,140 @@ class PmxApiClient:
                     upid, timeout))
             await asyncio.sleep(1)
 
+    # nodemedia: virtual CD-ROMs.
+
+    async def get_vm_media(self, vm):
+        cfg = next_config(await self.api('GET', 'pending', vm=vm))
+        media = []
+        for key in cdrom_drives(cfg):
+            volume, _ = drive_options(cfg[key])
+            if volume == 'none':
+                continue
+            location, sep, name = volume.rpartition('/')
+            media.append({'name': name, 'url': location if sep else None, 'secure': True})
+        return media
+
+    async def iso_storage(self, host):
+        """First active ISO storage on host."""
+        stores = await self.api('GET', '/api2/json/nodes/{}/storage?content=iso&enabled=1'.format(host))
+        for store in sorted(stores or [], key=lambda s: s['storage']):
+            if store.get('active', 1):
+                return store['storage']
+        # PVE lists only storages the user can audit.
+        raise exc.InvalidArgumentException(
+            'No active storage for ISO images (content type iso) on Proxmox node {} is visible to {}; '
+            'it needs Datastore.Audit on that storage'.format(host, self.user))
+
+    async def attach_media(self, vm, url):
+        """Insert url in the CD-ROM: http(s)/ftp is downloaded to ISO storage
+        (reused if present); pve://storage:path is an existing volume.
+
+        The confluent input check treats anything without '://' as a local file.
+        """
+        if url.startswith('pve://'):
+            url = url[len('pve://'):]
+        if re.match(r'(https?|ftp)://', url):
+            host, _ = await self.get_vm(vm)
+            storage = await self.iso_storage(host)
+            name = urlparse.unquote(urlparse.urlsplit(url).path.rsplit('/', 1)[-1])
+            if not re.match(r'[\w.+-]+\.(iso|img)$', name, re.I):
+                raise exc.InvalidArgumentException(
+                    'The URL must name an .iso or .img file, as Proxmox stores it under that name: {}'.format(url))
+            volid = '{}:iso/{}'.format(storage, name)
+            content = await self.api('GET', '/api2/json/nodes/{}/storage/{}/content?content=iso'.format(
+                host, storage))
+            if volid not in [item.get('volid') for item in content or []]:
+                try:
+                    upid = await self.api('POST', '/api2/json/nodes/{}/storage/{}/download-url'.format(
+                        host, storage), {'content': 'iso', 'filename': name, 'url': url})
+                except exc.TargetResourceUnavailable as e:
+                    if 'HTTP 403' not in str(e):
+                        raise
+                    # PVE's 403 does not say which right (PVE 9.2).
+                    raise exc.TargetResourceUnavailable(
+                        '{} may not download to {}: that needs Datastore.AllocateTemplate on the storage '
+                        'and both Sys.Audit and Sys.Modify on / ({})'.format(self.user, storage, e))
+                await self.wait_task(host, upid, 3600)
+        elif re.match(r'[\w.-]+:[^/]', url):
+            volid = url
+        else:
+            raise exc.InvalidArgumentException(
+                'Proxmox media must be an http(s) or ftp URL, or a volume (pve://storage:iso/name.iso); '
+                'use nodemedia upload for a local file')
+        await self.insert_cdrom(vm, volid)
+
+    async def insert_cdrom(self, vm, volid):
+        cfg = next_config(await self.api('GET', 'pending', vm=vm))
+        drives = cdrom_drives(cfg)
+        if drives:
+            slot = drives[0]
+        else:
+            free = [slot for slot in _CDROMSLOTS if slot not in cfg]
+            if not free:
+                raise exc.InvalidArgumentException('{} has no CD-ROM and no free IDE/SATA slot'.format(vm))
+            slot = free[0]
+        await self.api('PUT', 'config', {slot: '{},media=cdrom'.format(volid)}, vm=vm)
+        if not drives and await self.get_vm_power(vm) == 'on':
+            log.log({'info': '{}: added CD-ROM {} with {}; a running VM sees it after its next cold '
+                             'start'.format(vm, slot, volid)})
+
+    async def detach_media(self, vm):
+        cfg = next_config(await self.api('GET', 'pending', vm=vm))
+        update = {}
+        for key in cdrom_drives(cfg):
+            if drive_options(cfg[key])[0] != 'none':
+                update[key] = 'none,media=cdrom'
+        if update:
+            await self.api('PUT', 'config', update, vm=vm)
+
+    async def upload_media(self, vm, filename, progress, data=None):
+        """nodemedia upload: stream a local image to ISO storage, then insert it."""
+        host, _ = await self.get_vm(vm)
+        storage = await self.iso_storage(host)
+        if not self.logged:
+            await self.login()
+        name = os.path.basename(filename)
+        fileobj = data if data is not None else open(filename, 'rb')
+        try:
+            fileobj.seek(0, 2)
+            size = fileobj.tell()
+            fileobj.seek(0)
+            boundary = secrets.token_hex(16)
+            head = ('--{0}\r\nContent-Disposition: form-data; name="content"\r\n\r\niso\r\n'
+                    '--{0}\r\nContent-Disposition: form-data; name="filename"; filename="{1}"\r\n'
+                    'Content-Type: application/octet-stream\r\n\r\n').format(boundary, name).encode()
+            tail = '\r\n--{0}--\r\n'.format(boundary).encode()
+
+            async def body():
+                yield head
+                sent = 0
+                while True:
+                    chunk = await asyncio.to_thread(fileobj.read, 1 << 20)
+                    if not chunk:
+                        break
+                    sent += len(chunk)
+                    progress({'phase': 'upload', 'progress': 100.0 * sent / size if size else 100.0})
+                    yield chunk
+                yield tail
+            headers = dict(self.wc.stdheaders)
+            headers['Content-Type'] = 'multipart/form-data; boundary=' + boundary
+            headers['Content-Length'] = str(len(head) + size + len(tail))
+            url = 'https://{}:8006/api2/json/nodes/{}/storage/{}/upload'.format(self.wc.host, host, storage)
+            async with aiohttp.ClientSession(cookie_jar=self.wc.cookies,
+                                             timeout=aiohttp.ClientTimeout(total=None)) as session:
+                async with session.post(url, data=body(), headers=headers, ssl=self.wc.ssl) as rsp:
+                    rspbody = await rsp.read()
+                    if rsp.status != 200:
+                        raise exc.TargetResourceUnavailable('Upload of {} to {} on {} failed: {}'.format(
+                            name, storage, host, pve_error(rspbody, rsp.status)))
+                    upid = json.loads(rspbody).get('data')
+        finally:
+            fileobj.close()
+        if upid:
+            # Task moves the upload into the storage.
+            await self.wait_task(host, upid, 600)
+        await self.insert_cdrom(vm, '{}:iso/{}'.format(storage, name))
+
     # nodeconfig: VM settings.
 
     async def get_vm_settings(self, vm):
@@ -1052,6 +1192,9 @@ async def _retrieve_node(client, node, element):
     elif element == ['health', 'hardware']:
         yield msg.HealthSummary('unknown', node)
         yield msg.SensorReadings([], node)
+    elif element == ['media', 'current']:
+        for media in await client.get_vm_media(node):
+            yield msg.Media(node, rawmedia=media)
     elif element[:2] == ['configuration', 'system'] and element[2:] in (['all'], ['advanced']):
         yield msg.ConfigSet(node, await client.get_vm_settings(node))
     elif element[:3] == ['configuration', 'management_controller', 'extended']:
@@ -1093,7 +1236,15 @@ async def _retrieve_node(client, node, element):
         yield _unsupported(node, element)
 
 
+_TRANSFERS = (('media/uploads', 'mediaupload'),)
+
+
 async def retrieve(nodes, element, configmanager, inputdata):
+    for prefix, kind in _TRANSFERS:
+        if '/'.join(element).startswith(prefix):
+            for ret in firmwaremanager.list_updates(nodes, configmanager.tenant, element, kind):
+                yield ret
+            return
     async for rsp in _per_node(nodes, element, configmanager,
                                lambda client, node: _retrieve_node(client, node, element)):
         yield rsp
@@ -1110,6 +1261,10 @@ async def _update_node(client, node, element, inputdata):
         nextdev, bootmode, _ = await client.get_vm_bootdev(node)
         # Persistent if one-time was requested without the hookscript.
         yield msg.BootDevice(node, nextdev, bootmode=bootmode, persistent=applied_persistent)
+    elif element == ['media', 'attach']:
+        await client.attach_media(node, inputdata.nodefile(node))
+    elif element == ['media', 'detach']:
+        await client.detach_media(node)
     elif element[:2] == ['configuration', 'system'] and element[2:] in (['all'], ['advanced']):
         await client.set_vm_settings(node, inputdata.get_attributes(node))
     elif element == ['configuration', 'system', 'clear']:
@@ -1159,6 +1314,13 @@ async def create(nodes, element, configmanager, inputdata):
         except Exception as e:
             yield msg.ConfluentNodeError(node, str(e))
             continue
+        if element == ['media', 'uploads']:
+            upload = firmwaremanager.Updater(
+                node, functools.partial(clientsbynode[node].upload_media, node),
+                inputdata.nodefile(node), configmanager.tenant, type='mediaupload',
+                configmanager=configmanager)
+            yield msg.CreatedResource('nodes/{0}/media/uploads/{1}'.format(node, upload.name))
+            continue
         if element == ['console', 'ikvm']:
             currclient = clientsbynode[node]
             if currclient.token:
@@ -1179,6 +1341,16 @@ async def create(nodes, element, configmanager, inputdata):
         serialdata = await clientsbynode[node].get_vm_serial(node)
         yield PmxConsole(serialdata, node, configmanager, clientsbynode[node])
         return
+
+
+async def delete(nodes, element, configmanager, inputdata):
+    for prefix, kind in _TRANSFERS:
+        if '/'.join(element).startswith(prefix):
+            for ret in firmwaremanager.remove_updates(nodes, configmanager.tenant, element, type=kind):
+                yield ret
+            return
+    for node in nodes:
+        yield _unsupported(node, element)
 
 
 async def _selftest():
