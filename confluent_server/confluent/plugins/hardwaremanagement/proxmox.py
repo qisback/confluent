@@ -207,6 +207,67 @@ def tag_list(cfg):
 # nodeidentify: no LED on a VM, so a tag shown in the PVE UI.
 IDENTIFY_TAG = 'confluent-identify'
 
+_MIB = 1048576.0
+# name, status/current key, scale, units, valid while stopped.
+_SENSORS = (
+    ('CPU Usage', 'cpu', 100.0, '%', False),
+    ('CPUs', 'cpus', 1, None, True),
+    ('Memory Used', 'mem', 1 / _MIB, 'MiB', False),
+    ('Memory Total', 'maxmem', 1 / _MIB, 'MiB', True),
+    ('Disk Read', 'diskread', 1 / _MIB, 'MiB', False),
+    ('Disk Written', 'diskwrite', 1 / _MIB, 'MiB', False),
+    ('Network Received', 'netin', 1 / _MIB, 'MiB', False),
+    ('Network Sent', 'netout', 1 / _MIB, 'MiB', False),
+    ('Uptime', 'uptime', 1, 's', False),
+    # PVE 9+.
+    ('CPU Pressure', 'pressurecpusome', 1, '%', False),
+    ('Memory Pressure', 'pressurememorysome', 1, '%', False),
+    ('IO Pressure', 'pressureiosome', 1, '%', False),
+)
+
+
+def vm_sensors(status):
+    running = status.get('status') == 'running'
+    readings = []
+    for name, key, scale, units, static in _SENSORS:
+        if key not in status:
+            continue
+        reading = {'name': name, 'value': None, 'units': units, 'states': [], 'health': 'ok', 'type': 'VM'}
+        if running or static:
+            value = status[key]
+            try:
+                reading['value'] = round(float(value) * scale, 2)
+            except (TypeError, ValueError):
+                reading['states'] = ['Unavailable']
+        else:
+            reading['states'] = ['Unavailable']
+        readings.append(reading)
+    return readings
+
+
+# Unhealthy QEMU run states.
+_QMPHEALTH = {'paused': 'warning', 'io-error': 'critical', 'internal-error': 'critical',
+              'guest-panicked': 'critical'}
+
+
+def vm_health(status):
+    """(health, non-ok readings) from status/current."""
+    bad = []
+    if status.get('status') == 'running':
+        qmp = status.get('qmpstatus')
+        if qmp in _QMPHEALTH:
+            bad.append({'name': 'VM State', 'value': None, 'units': None, 'states': [qmp],
+                        'health': _QMPHEALTH[qmp], 'type': 'VM'})
+    hastate = (status.get('ha') or {}).get('state')
+    if hastate == 'error':
+        bad.append({'name': 'HA State', 'value': None, 'units': None, 'states': [hastate],
+                    'health': 'critical', 'type': 'VM'})
+    health = 'ok'
+    for reading in bad:
+        if reading['health'] == 'critical' or health == 'ok':
+            health = reading['health']
+    return health, bad
+
 
 def agent_enabled(cfg):
     # '1', '1,fstrim_cloned_disks=1' or 'enabled=1,...'.
@@ -1236,8 +1297,23 @@ async def _retrieve_node(client, node, element):
             items = [item for item in items if element[3] in [simplify(name) for name in item] + list(item)]
         yield msg.Firmware(items, node)
     elif element == ['health', 'hardware']:
-        yield msg.HealthSummary('unknown', node)
-        yield msg.SensorReadings([], node)
+        health, bad = vm_health(await client.get_vm_status(node))
+        yield msg.HealthSummary(health, node)
+        yield msg.SensorReadings(bad, node)
+    elif element[:2] == ['sensors', 'hardware'] and len(element) >= 3:
+        if element[2] == 'normalized':
+            yield _unsupported(node, element)
+            return
+        # No temperature, fan, power or energy sensors on a VM.
+        readings = vm_sensors(await client.get_vm_status(node)) if element[2] == 'all' else []
+        if len(element) == 3:
+            yield msg.ChildCollection('all')
+            for reading in readings:
+                yield msg.ChildCollection(simplify(reading['name']))
+            return
+        if element[3] != 'all':
+            readings = [r for r in readings if simplify(r['name']) == element[3]]
+        yield msg.SensorReadings(readings, node)
     elif element == ['identify']:
         yield msg.IdentifyState(node, await client.get_vm_identify(node))
     elif element == ['media', 'current']:
