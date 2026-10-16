@@ -613,6 +613,9 @@ class PmxApiClient:
         self.vmdupes = {}
         self.vmlist = {}
         self.vmbyid = {}
+        # Per request: PVE node -> {guest: status} from one list; guest -> HA state.
+        self.statusbynode = {}
+        self.hastate = {}
         # node -> custom.pve.isostorage: where nodemedia puts ISO images.
         self.isostorage = {}
         self.logged = False
@@ -716,6 +719,8 @@ class PmxApiClient:
         for datum in resources or []:
             if datum['type'] == 'qemu' and not datum.get('template'):
                 byname.setdefault(datum.get('name'), []).append((datum['node'], datum['id']))
+                if datum.get('hastate'):
+                    self.hastate[datum['id']] = datum['hastate']
         self.vmmap = dict((name, vms[0]) for name, vms in byname.items() if len(vms) == 1)
         self.vmdupes = dict((name, [guest for _, guest in vms]) for name, vms in byname.items() if len(vms) > 1)
         return self.vmmap
@@ -761,7 +766,24 @@ class PmxApiClient:
             return {'error': 'HTTP ' + str(e).split(': HTTP ', 1)[-1]}
         return info
 
-    async def get_vm_status(self, vm):
+    async def get_vm_status(self, vm, cached=False):
+        """status/current. cached: one live list per PVE node serves every VM on it,
+        for reads across many VMs; a VM missing from it is asked for itself.
+        """
+        if cached:
+            host, guest = await self.get_vm(vm)
+            if host not in self.statusbynode:
+                try:
+                    vms = await self.api('GET', '/api2/json/nodes/{}/qemu?full=1'.format(host))
+                except exc.TargetResourceUnavailable:
+                    vms = []
+                self.statusbynode[host] = dict(('qemu/{}'.format(d.get('vmid')), d) for d in vms or [])
+            status = self.statusbynode[host].get(guest)
+            if status is not None:
+                # The list has no HA state; the cluster resources do.
+                if guest in self.hastate:
+                    status = dict(status, ha={'managed': 1, 'state': self.hastate[guest]})
+                return status
         return await self.api('GET', 'status/current', vm=vm)
 
     async def get_vm_firmware(self, vm):
@@ -1061,9 +1083,9 @@ class PmxApiClient:
         raise exc.TargetResourceUnavailable(
             'Unknown power status {!r} (qmpstatus {!r}) for {}'.format(currstatus, rsp.get('qmpstatus'), vm))
 
-    async def get_vm_powerstate(self, vm):
+    async def get_vm_powerstate(self, vm, cached=False):
         """on, off, paused, suspended (to RAM) or hibernated (to disk)."""
-        rsp = await self.get_vm_status(vm)
+        rsp = await self.get_vm_status(vm, cached)
         if rsp.get('status') == 'running':
             return {'paused': 'paused', 'suspended': 'suspended'}.get(rsp.get('qmpstatus'), 'on')
         if rsp.get('status') == 'stopped':
@@ -1271,7 +1293,7 @@ async def _inventory_items(client, node):
 
 async def _retrieve_node(client, node, element):
     if element == ['power', 'state']:
-        yield msg.PowerState(node, await client.get_vm_powerstate(node))
+        yield msg.PowerState(node, await client.get_vm_powerstate(node, cached=True))
     elif element == ['boot', 'nextdevice']:
         nextdev, bootmode, persistent = await client.get_vm_bootdev(node)
         yield msg.BootDevice(node, nextdev, bootmode=bootmode, persistent=persistent)
@@ -1297,7 +1319,7 @@ async def _retrieve_node(client, node, element):
             items = [item for item in items if element[3] in [simplify(name) for name in item] + list(item)]
         yield msg.Firmware(items, node)
     elif element == ['health', 'hardware']:
-        health, bad = vm_health(await client.get_vm_status(node))
+        health, bad = vm_health(await client.get_vm_status(node, cached=True))
         yield msg.HealthSummary(health, node)
         yield msg.SensorReadings(bad, node)
     elif element[:2] == ['sensors', 'hardware'] and len(element) >= 3:
@@ -1305,7 +1327,7 @@ async def _retrieve_node(client, node, element):
             yield _unsupported(node, element)
             return
         # No temperature, fan, power or energy sensors on a VM.
-        readings = vm_sensors(await client.get_vm_status(node)) if element[2] == 'all' else []
+        readings = vm_sensors(await client.get_vm_status(node, cached=True)) if element[2] == 'all' else []
         if len(element) == 3:
             yield msg.ChildCollection('all')
             for reading in readings:
