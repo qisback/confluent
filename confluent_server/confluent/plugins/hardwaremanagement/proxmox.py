@@ -19,6 +19,7 @@ import json
 import os
 import re
 import secrets
+import time
 import urllib.parse as urlparse
 import aiohttp
 
@@ -267,6 +268,40 @@ def vm_health(status):
         if reading['health'] == 'critical' or health == 'ok':
             health = reading['health']
     return health, bad
+
+
+_TASKNAMES = {
+    'qmstart': 'Start', 'qmstop': 'Stop', 'qmshutdown': 'Shutdown', 'qmreboot': 'Reboot',
+    'qmreset': 'Reset', 'qmsuspend': 'Suspend', 'qmresume': 'Resume', 'qmpause': 'Pause',
+    'qmigrate': 'Migrate', 'qmclone': 'Clone', 'qmcreate': 'Create', 'qmdestroy': 'Destroy',
+    'qmconfig': 'Configure', 'qmmove': 'Move disk', 'qmrestore': 'Restore', 'qmtemplate': 'Make template',
+    'qmsnapshot': 'Snapshot', 'qmdelsnapshot': 'Delete snapshot', 'qmrollback': 'Roll back snapshot',
+    'vzdump': 'Backup', 'vncproxy': 'VNC console', 'termproxy': 'Serial console',
+    'hamigrate': 'HA migrate', 'hastart': 'HA start', 'hastop': 'HA stop',
+}
+
+
+def task_event(task):
+    """Event log entry from a PVE task list item."""
+    status = task.get('status') or 'running'
+    if status in ('OK', 'running'):
+        severity = 'ok'
+    elif status.startswith('WARNINGS'):
+        severity = 'warning'
+    else:
+        severity = 'critical'
+    name = _TASKNAMES.get(task.get('type'), task.get('type'))
+    return {
+        'severity': severity,
+        'timestamp': time.strftime('%Y-%m-%dT%H:%M:%S', time.localtime(int(task.get('starttime', 0)))),
+        'event': '{}: {}'.format(name, status),
+        'message': '{} by {} on {}'.format(name, task.get('user'), task.get('node')),
+        'component': 'VM {}'.format(task.get('id')),
+        'component_type': 'Task',
+        'id': task.get('type'),
+        'record_id': task.get('upid'),
+        'log_id': 'tasks',
+    }
 
 
 def agent_enabled(cfg):
@@ -613,6 +648,7 @@ class PmxApiClient:
         self.vmdupes = {}
         self.vmlist = {}
         self.vmbyid = {}
+        self.pvenodes = []
         # Per request: PVE node -> {guest: status} from one list; guest -> HA state.
         self.statusbynode = {}
         self.hastate = {}
@@ -716,6 +752,8 @@ class PmxApiClient:
         resources = await self.api('GET', '/api2/json/cluster/resources')
         # Names need not be unique; templates are skipped.
         byname = {}
+        self.pvenodes = sorted(datum['node'] for datum in resources or []
+                               if datum['type'] == 'node' and datum.get('status') != 'offline')
         for datum in resources or []:
             if datum['type'] == 'qemu' and not datum.get('template'):
                 byname.setdefault(datum.get('name'), []).append((datum['node'], datum['id']))
@@ -798,6 +836,26 @@ class PmxApiClient:
                               or cfg.get('machine') or 'pc (newest i440fx)'}},
             {'Proxmox VE': {'version': (version or {}).get('version')}},
         ]
+
+    async def get_vm_events(self, vm):
+        """Task history from every cluster node (migrated VMs span several).
+
+        Without Sys.Audit, PVE lists only the caller's own tasks.
+        """
+        host, guest = await self.get_vm(vm)
+        vmid = guest.split('/')[-1]
+        events = []
+        for pvenode in self.pvenodes or [host]:
+            try:
+                tasklist = await self.api('GET', '/api2/json/nodes/{}/tasks?vmid={}&limit=500&source=all'.format(
+                    pvenode, vmid))
+            except exc.TargetResourceUnavailable:
+                if pvenode == host:
+                    raise
+                continue
+            events.extend(task for task in tasklist or [] if str(task.get('id')) == vmid)
+        events.sort(key=lambda task: int(task.get('starttime', 0)))
+        return [task_event(task) for task in events]
 
     async def get_vm_location(self, vm):
         host, guest = await self.get_vm(vm)
@@ -1336,6 +1394,8 @@ async def _retrieve_node(client, node, element):
         if element[3] != 'all':
             readings = [r for r in readings if simplify(r['name']) == element[3]]
         yield msg.SensorReadings(readings, node)
+    elif element == ['events', 'hardware', 'log']:
+        yield msg.EventCollection(await client.get_vm_events(node), node)
     elif element == ['identify']:
         yield msg.IdentifyState(node, await client.get_vm_identify(node))
     elif element == ['media', 'current']:
@@ -1503,7 +1563,11 @@ async def delete(nodes, element, configmanager, inputdata):
                 yield ret
             return
     for node in nodes:
-        yield _unsupported(node, element)
+        if element == ['events', 'hardware', 'log']:
+            yield msg.ConfluentNodeError(node, 'The event log of a Proxmox VM is its PVE task history, '
+                                               'which cannot be cleared from confluent')
+        else:
+            yield _unsupported(node, element)
 
 
 async def _selftest():
