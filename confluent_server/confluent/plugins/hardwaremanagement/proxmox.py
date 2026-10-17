@@ -622,29 +622,15 @@ class PmxApiClient:
         self.user = user
         self.password = password
         self.pac = None
-        pinnode, pinfield = server, 'pubkeys.tls'
-        if configmanager and node is not None and \
-                server not in configmanager.get_node_attributes(server, 'pubkeys.tls'):
-            # Manager is not a confluent node: pin on the guest's node, as the console does.
-            pinnode, pinfield = node, 'pubkeys.tls_hardwaremanager'
-        if configmanager:
-            cv = util.TLSCertVerifier(
-                configmanager, pinnode, pinfield, subject=server
-            ).verify_cert
-        else:
-            def cv(x):
-                return True
-
+        self.configmanager = configmanager
+        self.pinguest = node
+        # hardwaremanagement.manager: one or more nodes of a cluster, comma separated.
+        self.servers = [s.strip() for s in server.split(',') if s.strip()] or [server]
         try:
             self.user = self.user.decode()
             self.password = self.password.decode()
         except Exception:
             pass
-        self.server = server
-        self.wc = webclient.WebConnection(server, port=8006, verifycallback=cv)
-        self.fprint = None
-        if configmanager:
-            self.fprint = configmanager.get_node_attributes(pinnode, pinfield).get(pinnode, {}).get(pinfield, {}).get('value', None)
         self.vmmap = {}
         self.vmdupes = {}
         self.vmlist = {}
@@ -655,7 +641,47 @@ class PmxApiClient:
         self.hastate = {}
         # node -> custom.pve.isostorage: where nodemedia puts ISO images.
         self.isostorage = {}
+        self.use_server(self.servers[0])
+
+    def use_server(self, server):
+        configmanager = self.configmanager
+        pinnode, pinfield = server, 'pubkeys.tls'
+        if configmanager and self.pinguest is not None and \
+                server not in configmanager.get_node_attributes(server, 'pubkeys.tls'):
+            # Manager is not a confluent node: pin on the guest's node, as the
+            # console does. One pin only; several managers need their own nodes.
+            pinnode, pinfield = self.pinguest, 'pubkeys.tls_hardwaremanager'
+        if configmanager:
+            cv = util.TLSCertVerifier(
+                configmanager, pinnode, pinfield, subject=server
+            ).verify_cert
+        else:
+            def cv(x):
+                return True
+        self.server = server
+        self.pin = '{}.{}'.format(pinnode, pinfield)
+        self.wc = webclient.WebConnection(server, port=8006, verifycallback=cv)
+        self.fprint = None
+        if configmanager:
+            self.fprint = configmanager.get_node_attributes(pinnode, pinfield).get(pinnode, {}).get(pinfield, {}).get('value', None)
+        self.pac = None
         self.logged = False
+
+    def next_server(self):
+        """Switch to the next manager; False if there is only one."""
+        if len(self.servers) < 2:
+            return False
+        self.use_server(self.servers[(self.servers.index(self.server) + 1) % len(self.servers)])
+        return True
+
+    def unreachable(self, error):
+        # Pin mismatch raises PubkeyInvalid.
+        if isinstance(error, (exc.PubkeyInvalid, pygexc.UnrecognizedCertificate)):
+            return exc.TargetEndpointUnreachable(
+                "Proxmox server '{}' presented a certificate that does not match {}{}".format(
+                    self.server, self.pin, '; with several managers, define each as a confluent node '
+                    'so each has its own pin' if len(self.servers) > 1 else ''))
+        return exc.TargetEndpointUnreachable("Unable to reach Proxmox server '{}'".format(self.server))
 
     @property
     def token(self):
@@ -663,6 +689,18 @@ class PmxApiClient:
         return '!' in (self.user or '')
 
     async def login(self):
+        """Log in to the first manager that answers."""
+        errors = []
+        for _ in self.servers:
+            try:
+                return await self.login_one()
+            except exc.TargetEndpointUnreachable as e:
+                errors.append(str(e))
+                if not self.next_server():
+                    raise
+        raise exc.TargetEndpointUnreachable('; '.join(errors))
+
+    async def login_one(self):
         if self.token:
             # Stateless: no ticket or CSRF token; a bad token is a 401 on first use.
             self.wc.set_header('Authorization', 'PVEAPIToken={}={}'.format(self.user, self.password))
@@ -675,8 +713,8 @@ class PmxApiClient:
         loginbody = urlparse.urlencode(loginform)
         try:
             body, status = await self.wc.grab_json_response_with_status('/api2/json/access/ticket', loginbody, headers={'Content-Type': 'application/x-www-form-urlencoded'})
-        except Exception:
-            raise exc.TargetEndpointUnreachable("Unable to reach Proxmox server '{}'".format(self.server))
+        except Exception as e:
+            raise self.unreachable(e)
         if status == 401:
             raise exc.TargetEndpointBadCredentials("Bad credentials")
         data = body.get('data') if isinstance(body, dict) else None
@@ -705,6 +743,7 @@ class PmxApiClient:
         retried = set()
         lockwaits = 0
         lockstart = 0.0
+        failovers = 0
         while True:
             if not self.logged:
                 await self.login()
@@ -714,8 +753,13 @@ class PmxApiClient:
                 url = f'/api2/json/nodes/{host}/{guest}/{path}'
             try:
                 body, status = await self.wc.grab_json_response_with_status(url, data, method=method)
-            except Exception:
-                raise exc.TargetEndpointUnreachable("Unable to reach Proxmox server '{}'".format(self.server))
+            except Exception as e:
+                # Manager gone: fail over.
+                failed = self.unreachable(e)
+                if failovers < len(self.servers) - 1 and self.next_server():
+                    failovers += 1
+                    continue
+                raise failed
             if 200 <= status < 300:
                 if lockwaits:
                     log.log({'info': '{}: waited {:.0f}s for the VM config lock'.format(
@@ -788,6 +832,27 @@ class PmxApiClient:
         if component != 'all':
             invitems = [item for item in invitems if component in (item['name'], simplify(item['name']))]
         yield msg.KeyValueData({'inventory': invitems}, vm)
+
+    # nodebmcreset / nodebmcpassword act on confluent's Proxmox login.
+
+    async def reset_session(self):
+        self.vmmap = {}
+        self.use_server(self.servers[0])
+        await self.login()
+
+    async def set_login_password(self, newpassword):
+        """Change the login's Proxmox password; False if unchanged (shared login)."""
+        if self.token:
+            raise exc.InvalidArgumentException(
+                '{} is an API token, which has no password: create a new token in Proxmox and '
+                'store its secret as secret.hardwaremanagementpassword'.format(self.user))
+        if newpassword == self.password:
+            return False
+        await self.api('PUT', '/api2/json/access/password', {
+            'userid': self.user, 'password': newpassword, 'confirmation-password': self.password})
+        self.password = newpassword
+        self.logged = False
+        return True
 
     async def get_guest_info(self, vm, cfg):
         """Guest agent OS and interfaces; None if no agent or VM off, {'error'} if it fails.
@@ -1221,6 +1286,8 @@ class PmxApiClient:
 
     # Seconds per action; shutdown waits on the guest's ACPI handling.
     power_timeout = {'start': 60, 'stop': 60, 'shutdown': 300}
+    # Extra seconds for HA-managed VMs (CRM/LRM 10s cycles).
+    ha_delay = 60
 
     async def set_vm_power(self, vm, state):
         current = None
@@ -1263,13 +1330,17 @@ class PmxApiClient:
                 await self.api('POST', 'status/reset', vm=vm)
             return 'reset', current
         target = 'on' if action == 'start' else 'off'
+        timeout = self.power_timeout[action]
+        if ((await self.get_vm_status(vm)).get('ha') or {}).get('managed'):
+            # The task only files an HA request; the CRM acts later.
+            timeout += self.ha_delay
         # Retry a task that lost the config lock race.
         for attempt in range(3):
             # PVE's own shutdown timeout is shorter.
             params = {'timeout': self.power_timeout['shutdown']} if action == 'shutdown' else None
             upid = await self.api('POST', f'status/{action}', params, vm=vm)
             try:
-                return await self.wait_power(vm, target, self.power_timeout[action], upid), current
+                return await self.wait_power(vm, target, timeout, upid), current
             except TaskFailed as e:
                 if "can't lock file" not in str(e) or attempt == 2:
                     raise exc.TargetResourceUnavailable(str(e))
@@ -1467,6 +1538,10 @@ async def _retrieve_node(client, node, element):
         yield msg.ConfigSet(node, settings)
     elif element == ['configuration', 'management_controller', 'location']:
         yield msg.KeyValueData(await client.get_vm_location(node), node)
+    elif element == ['configuration', 'management_controller', 'users', 'all']:
+        # confluent's Proxmox login as BMC user 1.
+        yield msg.UserCollection([{'uid': 1, 'username': client.user, 'expiration': None,
+                                   'privilege_level': 'proxmox'}], node)
     elif element == ['configuration', 'management_controller', 'net_interfaces']:
         yield msg.ChildCollection('management')
     elif element == ['configuration', 'management_controller', 'net_interfaces', 'management']:
@@ -1512,7 +1587,26 @@ async def retrieve(nodes, element, configmanager, inputdata):
         yield rsp
 
 
-async def _update_node(client, node, element, inputdata):
+async def _store_login_password(configmanager, client):
+    """Store a changed password on every node sharing the login, not only those requested."""
+    def text(value):
+        return value.decode() if isinstance(value, bytes) else value
+    allnodes = list(configmanager.list_nodes())
+    attrs = configmanager.get_node_attributes(
+        allnodes, ['hardwaremanagement.manager', 'secret.hardwaremanagementuser'], decrypt=True)
+    same = []
+    for node, nodeattrs in attrs.items():
+        managers = set(s.strip() for s in (nodeattrs.get('hardwaremanagement.manager', {}).get('value') or '').split(','))
+        if managers & set(client.servers) and \
+                text(nodeattrs.get('secret.hardwaremanagementuser', {}).get('value')) == client.user:
+            same.append(node)
+    if same:
+        await configmanager.set_node_attributes(
+            dict((node, {'secret.hardwaremanagementpassword': client.password}) for node in same))
+    log.log({'info': 'Proxmox password of {} changed; stored for {} node(s)'.format(client.user, len(same))})
+
+
+async def _update_node(client, node, element, inputdata, configmanager):
     if element == ['power', 'state']:
         newstate, oldstate = await client.set_vm_power(node, inputdata.powerstate(node))
         yield msg.PowerState(node, newstate, oldstate)
@@ -1539,6 +1633,15 @@ async def _update_node(client, node, element, inputdata):
     elif element == ['configuration', 'system', 'clear']:
         yield msg.ConfluentNodeError(node, 'A Proxmox VM has no firmware defaults to restore; set the '
                                            'settings to an empty value to return them to the PVE default')
+    elif element == ['configuration', 'management_controller', 'reset']:
+        await client.reset_session()
+        yield msg.BMCReset(node, 'reset')
+    elif element == ['configuration', 'management_controller', 'users', '1']:
+        newpassword = inputdata.get_attributes(node).get('password')
+        if not newpassword:
+            raise exc.InvalidArgumentException('Only the password of the Proxmox login can be changed')
+        if await client.set_login_password(newpassword):
+            await _store_login_password(configmanager, client)
     elif element[:2] == ['configuration', 'management_controller']:
         yield msg.ConfluentNodeError(node, 'A Proxmox VM has no management controller to configure; it is '
                                            'managed through Proxmox server {}'.format(client.server))
@@ -1568,7 +1671,7 @@ async def update(nodes, element, configmanager, inputdata):
             return
         return
     async for rsp in _per_node(nodes, element, configmanager,
-                               lambda client, node: _update_node(client, node, element, inputdata)):
+                               lambda client, node: _update_node(client, node, element, inputdata, configmanager)):
         yield rsp
 
 
