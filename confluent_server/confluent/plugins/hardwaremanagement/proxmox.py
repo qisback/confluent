@@ -19,6 +19,7 @@ import json
 import os
 import re
 import secrets
+import tarfile
 import time
 import urllib.parse as urlparse
 import aiohttp
@@ -804,6 +805,61 @@ class PmxApiClient:
             return {'error': 'HTTP ' + str(e).split(': HTTP ', 1)[-1]}
         return info
 
+    # Most recent task logs to include.
+    servicedata_tasklogs = 25
+
+    async def collect_servicedata(self, vm, filename, progress, data=None):
+        """nodesupport servicedata: config, pending, status, agent, tasks and task logs.
+
+        Writes <filename>.tar.gz; returns the path.
+        """
+        if not filename.endswith(('.tar.gz', '.tgz')):
+            filename += '.tar.gz'
+        if os.path.exists(filename):
+            raise exc.InvalidArgumentException('{} already exists, cannot overwrite'.format(filename))
+        host, guest = await self.get_vm(vm)
+        vmid = guest.split('/')[-1]
+        members = {}
+        members['config.json'] = await self.api('GET', 'config', vm=vm)
+        members['pending.json'] = await self.api('GET', 'pending', vm=vm)
+        members['status.json'] = await self.get_vm_status(vm)
+        members['guest-agent.json'] = await self.get_guest_info(vm, members['config.json'])
+        members['version.json'] = await self.api('GET', '/api2/json/version')
+        progress({'phase': 'download', 'progress': 10.0})
+        tasks = []
+        for pvenode in self.pvenodes or [host]:
+            try:
+                tasks.extend(t for t in await self.api(
+                    'GET', '/api2/json/nodes/{}/tasks?vmid={}&limit=500&source=all'.format(pvenode, vmid)) or []
+                    if str(t.get('id')) == vmid)
+            except exc.TargetResourceUnavailable as e:
+                if pvenode == host:
+                    raise
+                tasks.append({'node': pvenode, 'error': str(e)})
+        tasks.sort(key=lambda task: int(task.get('starttime', 0)))
+        members['tasks.json'] = tasks
+        recent = [t for t in tasks if t.get('upid')][-self.servicedata_tasklogs:]
+        for num, task in enumerate(recent):
+            lines = await self.api('GET', '/api2/json/nodes/{}/tasks/{}/log?limit=5000'.format(
+                task['node'], urlparse.quote(task['upid'], safe='')))
+            name = 'tasklogs/{}-{}-{}.log'.format(task.get('starttime'), task.get('type'), task['node'])
+            members[name] = '\n'.join(line.get('t', '') for line in lines or []) + '\n'
+            progress({'phase': 'download', 'progress': 10.0 + 85.0 * (num + 1) / len(recent)})
+
+        def write():
+            topdir = '{}-pve-{}'.format(vm, time.strftime('%Y%m%dT%H%M%S'))
+            with tarfile.open(filename, 'w:gz') as tar:
+                for name, content in members.items():
+                    if not isinstance(content, str):
+                        content = json.dumps(content, indent=2, sort_keys=True) + '\n'
+                    blob = content.encode('utf8')
+                    info = tarfile.TarInfo('{}/{}'.format(topdir, name))
+                    info.size = len(blob)
+                    info.mtime = int(time.time())
+                    tar.addfile(info, io.BytesIO(blob))
+        await asyncio.to_thread(write)
+        return filename
+
     async def get_vm_status(self, vm, cached=False):
         """status/current. cached: one live list per PVE node serves every VM on it,
         for reads across many VMs; a VM missing from it is asked for itself.
@@ -1442,7 +1498,7 @@ async def _retrieve_node(client, node, element):
         yield _unsupported(node, element)
 
 
-_TRANSFERS = (('media/uploads', 'mediaupload'),)
+_TRANSFERS = (('media/uploads', 'mediaupload'), ('support/servicedata', 'ffdc'))
 
 
 async def retrieve(nodes, element, configmanager, inputdata):
@@ -1533,6 +1589,13 @@ async def create(nodes, element, configmanager, inputdata):
                 inputdata.nodefile(node), configmanager.tenant, type='mediaupload',
                 configmanager=configmanager)
             yield msg.CreatedResource('nodes/{0}/media/uploads/{1}'.format(node, upload.name))
+            continue
+        if element == ['support', 'servicedata']:
+            download = firmwaremanager.Updater(
+                node, functools.partial(clientsbynode[node].collect_servicedata, node),
+                inputdata.nodefile(node), configmanager.tenant, type='ffdc',
+                owner=getattr(configmanager, 'current_user', None))
+            yield msg.CreatedResource('nodes/{0}/support/servicedata/{1}'.format(node, download.name))
             continue
         if element == ['console', 'ikvm']:
             currclient = clientsbynode[node]
