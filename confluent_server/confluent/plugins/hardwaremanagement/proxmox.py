@@ -532,6 +532,10 @@ async def rfb_capture(ws, password):
     return png_from_bgrx(width, height, bytes(frame))
 
 
+# CAs util.TLSCertVerifier trusts for a certificate that does not match its pin.
+SITE_CAS = '/var/lib/confluent/public/site/tls'
+
+
 class TaskFailed(Exception):
     """A PVE task ended with an error."""
 
@@ -759,7 +763,8 @@ class PmxApiClient:
         if configmanager and self.pinguest is not None and \
                 server not in configmanager.get_node_attributes(server, 'pubkeys.tls'):
             # Manager is not a confluent node: pin on the guest's node, as the
-            # console does. One pin only; several managers need their own nodes.
+            # console does. One pin only; several managers need their own nodes,
+            # or the cluster CA in site/tls.
             pinnode, pinfield = self.pinguest, 'pubkeys.tls_hardwaremanager'
         if configmanager:
             cv = util.TLSCertVerifier(
@@ -785,12 +790,15 @@ class PmxApiClient:
         return True
 
     def unreachable(self, error):
-        # Pin mismatch raises PubkeyInvalid.
+        # Pin mismatch raises PubkeyInvalid. A certificate the CAs in site/tls
+        # vouch for replaces the pin (util.TLSCertVerifier), so renewals by the
+        # cluster CA need nothing.
         if isinstance(error, (exc.PubkeyInvalid, pygexc.UnrecognizedCertificate)):
             return exc.TargetEndpointUnreachable(
-                "Proxmox server '{}' presented a certificate that does not match {}{}".format(
-                    self.server, self.pin, '; with several managers, define each as a confluent node '
-                    'so each has its own pin' if len(self.servers) > 1 else ''))
+                "Proxmox server '{}' presented a certificate that does not match {}{} and is not signed by a "
+                "CA in {} for that name; to trust the cluster's certificates, copy /etc/pve/pve-root-ca.pem "
+                "there".format(self.server, self.pin, ' (with several managers, define each as a confluent node '
+                               'so each has its own pin)' if len(self.servers) > 1 else '', SITE_CAS))
         return exc.TargetEndpointUnreachable("Unable to reach Proxmox server '{}'".format(self.server))
 
     @property
