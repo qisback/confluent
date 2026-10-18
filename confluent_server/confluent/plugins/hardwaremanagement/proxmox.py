@@ -19,8 +19,10 @@ import json
 import os
 import re
 import secrets
+import struct
 import tarfile
 import time
+import zlib
 import urllib.parse as urlparse
 import aiohttp
 
@@ -420,6 +422,114 @@ def system_settings(nextcfg, curcfg):
         'help': 'UEFI Secure Boot (EFI disk with pre-enrolled keys). Read only: changing it means '
                 'recreating the EFI disk'}
     return settings
+
+
+def vnc_auth_response(password, challenge):
+    """VNC auth: challenge DES-encrypted with the password, key bits reversed."""
+    try:
+        from cryptography.hazmat.decrepit.ciphers.algorithms import TripleDES
+    except ImportError:  # cryptography < 43
+        from cryptography.hazmat.primitives.ciphers.algorithms import TripleDES
+    from cryptography.hazmat.primitives.ciphers import Cipher, modes
+    key = (password.encode('utf8') + b'\0' * 8)[:8]
+    key = bytes(int('{:08b}'.format(b)[::-1], 2) for b in key)
+    # K1 = K2 = K3: single DES.
+    enc = Cipher(TripleDES(key * 3), modes.ECB()).encryptor()
+    return enc.update(challenge) + enc.finalize()
+
+
+def png_from_bgrx(width, height, pixels):
+    """PNG from a 32 bpp little-endian BGRX framebuffer."""
+    raw = bytearray()
+    for row in range(height):
+        line = pixels[row * width * 4:(row + 1) * width * 4]
+        rgb = bytearray(width * 3)
+        rgb[0::3] = line[2::4]
+        rgb[1::3] = line[1::4]
+        rgb[2::3] = line[0::4]
+        raw += b'\0' + rgb
+
+    def chunk(kind, data):
+        return struct.pack('>I', len(data)) + kind + data + struct.pack('>I', zlib.crc32(kind + data))
+    return (b'\x89PNG\r\n\x1a\n' + chunk(b'IHDR', struct.pack('>IIBBBBB', width, height, 8, 2, 0, 0, 0))
+            + chunk(b'IDAT', zlib.compress(bytes(raw), 6)) + chunk(b'IEND', b''))
+
+
+class _WsReader(object):
+    """Exact-length reads from a byte-stream websocket."""
+
+    def __init__(self, ws):
+        self.ws = ws
+        self.buf = b''
+
+    async def read(self, size):
+        while len(self.buf) < size:
+            frame = await self.ws.receive()
+            if frame.type == aiohttp.WSMsgType.BINARY:
+                self.buf += frame.data
+            elif frame.type == aiohttp.WSMsgType.TEXT:
+                self.buf += frame.data.encode()
+            else:
+                raise exc.TargetResourceUnavailable('The VNC session closed during the screenshot')
+        data, self.buf = self.buf[:size], self.buf[size:]
+        return data
+
+
+async def rfb_capture(ws, password):
+    """One full frame over RFB 3.8 in raw encoding, as PNG."""
+    rd = _WsReader(ws)
+    if not (await rd.read(12)).startswith(b'RFB '):
+        raise exc.TargetResourceUnavailable('The VNC proxy did not speak RFB')
+    await ws.send_bytes(b'RFB 003.008\n')
+    count = (await rd.read(1))[0]
+    if not count:
+        reason = await rd.read(struct.unpack('>I', await rd.read(4))[0])
+        raise exc.TargetResourceUnavailable('VNC refused the session: ' + reason.decode('utf8', 'replace'))
+    sectypes = await rd.read(count)
+    if 2 in sectypes:
+        await ws.send_bytes(b'\x02')
+        await ws.send_bytes(vnc_auth_response(password, await rd.read(16)))
+    elif 1 in sectypes:
+        await ws.send_bytes(b'\x01')
+    else:
+        raise exc.TargetResourceUnavailable('VNC offers no security type confluent supports: {}'.format(
+            list(sectypes)))
+    if struct.unpack('>I', await rd.read(4))[0] != 0:
+        raise exc.TargetResourceUnavailable('VNC authentication failed')
+    await ws.send_bytes(b'\x01')  # ClientInit: shared
+    width, height = struct.unpack('>HH', await rd.read(4))
+    await rd.read(16)  # server pixel format, overridden below
+    await rd.read(struct.unpack('>I', await rd.read(4))[0])  # desktop name
+    # 32 bpp, depth 24, little-endian, RGB shifts 16/8/0.
+    await ws.send_bytes(b'\x00\x00\x00\x00' + struct.pack('>BBBBHHHBBBxxx', 32, 24, 0, 1, 255, 255, 255, 16, 8, 0))
+    await ws.send_bytes(struct.pack('>BxHi', 2, 1, 0))  # SetEncodings: raw only
+    await ws.send_bytes(struct.pack('>BBHHHH', 3, 0, 0, 0, width, height))
+    frame = bytearray(width * height * 4)
+    covered = 0
+    while covered < width * height:
+        mtype = (await rd.read(1))[0]
+        if mtype == 0:  # FramebufferUpdate
+            await rd.read(1)
+            for _ in range(struct.unpack('>H', await rd.read(2))[0]):
+                x, y, w, h, encoding = struct.unpack('>HHHHi', await rd.read(12))
+                if encoding != 0:
+                    raise exc.TargetResourceUnavailable('VNC sent encoding {} for raw'.format(encoding))
+                data = await rd.read(w * h * 4)
+                for row in range(h):
+                    start = ((y + row) * width + x) * 4
+                    frame[start:start + w * 4] = data[row * w * 4:(row + 1) * w * 4]
+                covered += w * h
+        elif mtype == 1:  # SetColourMapEntries
+            await rd.read(1)
+            await rd.read(6 * struct.unpack('>HH', await rd.read(4))[1])
+        elif mtype == 2:  # Bell
+            continue
+        elif mtype == 3:  # ServerCutText
+            await rd.read(3)
+            await rd.read(struct.unpack('>I', await rd.read(4))[0])
+        else:
+            raise exc.TargetResourceUnavailable('Unexpected VNC message type {}'.format(mtype))
+    return png_from_bgrx(width, height, bytes(frame))
 
 
 class TaskFailed(Exception):
@@ -1220,6 +1330,34 @@ class PmxApiClient:
         await self.api('PUT', 'config', {'tpmstate0': '{}:1,version={}'.format(storage, version)}, vm=vm)
 
 
+    # Seconds, handshake and frame included.
+    screenshot_timeout = 30
+
+    async def get_vm_screenshot(self, vm):
+        """PNG of the VM's display via its VNC proxy."""
+        if self.token:
+            raise exc.InvalidArgumentException(
+                'A screenshot needs a Proxmox user with a password; API tokens cannot be passed '
+                'to the VNC proxy')
+        if await self.get_vm_power(vm) != 'on':
+            raise exc.InvalidArgumentException('{} is not running; it has no display'.format(vm))
+        consdata = await self.api('POST', 'vncproxy', {'websocket': 1, 'generate-password': 1}, vm=vm)
+        host, guest = await self.get_vm(vm)
+        url = 'wss://{}:8006/api2/json/nodes/{}/{}/vncwebsocket?port={}&vncticket={}'.format(
+            self.wc.host, host, guest, consdata['port'], urlparse.quote(consdata['ticket'], safe=''))
+        cookies = aiohttp.CookieJar(unsafe=True, quote_cookie=False)
+        cookies.update_cookies({'PVEAuthCookie': self.pac})
+        try:
+            async with aiohttp.ClientSession(cookie_jar=cookies) as session:
+                async with session.ws_connect(url, protocols=['binary'], ssl=self.wc.ssl) as ws:
+                    return await asyncio.wait_for(
+                        rfb_capture(ws, consdata.get('password') or consdata['ticket']), self.screenshot_timeout)
+        except asyncio.TimeoutError:
+            raise exc.TargetResourceUnavailable('No complete frame from VNC within {} seconds'.format(
+                self.screenshot_timeout))
+        except aiohttp.ClientError as e:
+            raise exc.TargetResourceUnavailable('VNC proxy connection failed: {}'.format(e))
+
     async def get_vm_ikvm(self, vm):
         return await self.get_vm_consproxy(vm, 'vnc')
 
@@ -1568,7 +1706,7 @@ async def _retrieve_node(client, node, element):
         yield msg.KeyValueData({'ikvm_methods': ['vnc']}, node)
     elif element == ['console', 'ikvm_screenshot']:
         # good background for the webui, and kitty
-        yield msg.ConfluentNodeError(node, "vnc available, screenshot not available")
+        yield msg.ScreenShot(await client.get_vm_screenshot(node), node, imgformat='png')
     else:
         yield _unsupported(node, element)
 
