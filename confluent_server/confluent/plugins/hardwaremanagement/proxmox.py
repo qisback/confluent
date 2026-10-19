@@ -532,6 +532,9 @@ async def rfb_capture(ws, password):
     return png_from_bgrx(width, height, bytes(frame))
 
 
+# hardwaremanagement.manager -> (time, other cluster node addresses).
+_clusternodes = {}
+
 # CAs util.TLSCertVerifier trusts for a certificate that does not match its pin.
 SITE_CAS = '/var/lib/confluent/public/site/tls'
 
@@ -740,6 +743,9 @@ class PmxApiClient:
         self.pinguest = node
         # hardwaremanagement.manager: one or more nodes of a cluster, comma separated.
         self.servers = [s.strip() for s in server.split(',') if s.strip()] or [server]
+        self.managers = server
+        # The cluster's other nodes, found by an earlier login, after the configured ones.
+        self.servers += [s for s in _clusternodes.get(server, (0, []))[1] if s not in self.servers]
         try:
             self.user = self.user.decode()
             self.password = self.password.decode()
@@ -811,12 +817,36 @@ class PmxApiClient:
         errors = []
         for _ in self.servers:
             try:
-                return await self.login_one()
+                await self.login_one()
             except exc.TargetEndpointUnreachable as e:
                 errors.append(str(e))
                 if not self.next_server():
                     raise
+            else:
+                await self.find_cluster_nodes()
+                return
         raise exc.TargetEndpointUnreachable('; '.join(errors))
+
+    async def find_cluster_nodes(self):
+        """Add the cluster's other online nodes (/cluster/status) to fail over to,
+        after the configured managers. Looked up once per cluster_ttl per setting.
+        """
+        found, now = _clusternodes.get(self.managers), time.monotonic()
+        if found and now - found[0] < self.cluster_ttl:
+            return
+        # Stamp first: the lookup itself may fail over and log in again.
+        _clusternodes[self.managers] = (now, found[1] if found else [])
+        try:
+            status = await self.api('GET', '/api2/json/cluster/status')
+        except exc.ConfluentException:
+            # The configured managers still work.
+            return
+        configured = [s.strip() for s in self.managers.split(',') if s.strip()]
+        names = set(s.split('.')[0] for s in configured)
+        addrs = [d['ip'] for d in status or [] if d.get('type') == 'node' and d.get('online') and d.get('ip')
+                 and d['ip'] not in configured and d.get('name') not in names]
+        _clusternodes[self.managers] = (now, addrs)
+        self.servers += [a for a in addrs if a not in self.servers]
 
     async def login_one(self):
         if self.token:
@@ -846,6 +876,9 @@ class PmxApiClient:
         self.wc.cookies.update_cookies({'PVEAuthCookie': self.pac})
         self.wc.set_header('CSRFPreventionToken', data['CSRFPreventionToken'])
         self.logged = True
+
+    # Seconds before the cluster's nodes are looked up again.
+    cluster_ttl = 600
 
     # PVE waits ~10s for the config lock per attempt.
     lock_retries = 5
